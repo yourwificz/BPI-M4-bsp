@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
 /*
  *  compress_offload.h - compress offload header definations
  *
@@ -30,7 +31,7 @@
 #include <sound/compress_params.h>
 
 
-#define SNDRV_COMPRESS_VERSION SNDRV_PROTOCOL_VERSION(0, 1, 2)
+#define SNDRV_COMPRESS_VERSION SNDRV_PROTOCOL_VERSION(0, 2, 0)
 /**
  * struct snd_compressed_buffer - compressed buffer
  * @fragment_size: size of buffer fragment in bytes
@@ -143,7 +144,7 @@ struct snd_compr_metadata {
 	 __u32 value[8];
 } __attribute__((packed, aligned(4)));
 
-/**
+/*
  * compress path ioctl definitions
  * SNDRV_COMPRESS_GET_CAPS: Query capability of DSP
  * SNDRV_COMPRESS_GET_CODEC_CAPS: Query capability of a codec
@@ -178,9 +179,6 @@ struct snd_compr_metadata {
 #define SNDRV_COMPRESS_START		_IO('C', 0x32)
 #define SNDRV_COMPRESS_STOP		_IO('C', 0x33)
 #define SNDRV_COMPRESS_DRAIN		_IO('C', 0x34)
-#ifdef CONFIG_RTK_PLATFORM
-#define SNDRV_COMPRESS_GET_LATENCY	_IOR('C', 0xf0, int)
-#endif /* CONFIG_RTK_PLATFORM */
 #define SNDRV_COMPRESS_NEXT_TRACK	_IO('C', 0x35)
 #define SNDRV_COMPRESS_PARTIAL_DRAIN	_IO('C', 0x36)
 /*
@@ -191,7 +189,4 @@ struct snd_compr_metadata {
 #define SND_COMPR_TRIGGER_DRAIN 7 /*FIXME move this to pcm.h */
 #define SND_COMPR_TRIGGER_NEXT_TRACK 8
 #define SND_COMPR_TRIGGER_PARTIAL_DRAIN 9
-#ifdef CONFIG_RTK_PLATFORM
-#define SND_COMPR_TRIGGER_GET_LATENCY 0xf
-#endif /* CONFIG_RTK_PLATFORM */
 #endif

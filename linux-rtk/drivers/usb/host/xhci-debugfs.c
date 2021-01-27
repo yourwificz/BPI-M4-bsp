@@ -1,1415 +1,719 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * xhci-debugfs.c - xHCI debugfs interface
+ *
+ * Copyright (C) 2017 Intel Corporation
+ *
+ * Author: Lu Baolu <baolu.lu@linux.intel.com>
+ */
 
-#include <linux/uaccess.h>
-#include <linux/debugfs.h>
 #include <linux/slab.h>
+#include <linux/uaccess.h>
+
 #include "xhci.h"
+#include "xhci-debugfs.h"
 
-#define XHCI_INIT_VALUE 0x0
+static const struct debugfs_reg32 xhci_cap_regs[] = {
+	dump_register(CAPLENGTH),
+	dump_register(HCSPARAMS1),
+	dump_register(HCSPARAMS2),
+	dump_register(HCSPARAMS3),
+	dump_register(HCCPARAMS1),
+	dump_register(DOORBELLOFF),
+	dump_register(RUNTIMEOFF),
+	dump_register(HCCPARAMS2),
+};
 
-#define TO_NEXT(next, size, inc) \
-do { 				\
-	size -= inc; 	\
-	next += inc; 	\
-} while (0)
+static const struct debugfs_reg32 xhci_op_regs[] = {
+	dump_register(USBCMD),
+	dump_register(USBSTS),
+	dump_register(PAGESIZE),
+	dump_register(DNCTRL),
+	dump_register(CRCR),
+	dump_register(DCBAAP_LOW),
+	dump_register(DCBAAP_HIGH),
+	dump_register(CONFIG),
+};
 
-static struct dentry *xhci_debug_root;
+static const struct debugfs_reg32 xhci_runtime_regs[] = {
+	dump_register(MFINDEX),
+	dump_register(IR0_IMAN),
+	dump_register(IR0_IMOD),
+	dump_register(IR0_ERSTSZ),
+	dump_register(IR0_ERSTBA_LOW),
+	dump_register(IR0_ERSTBA_HIGH),
+	dump_register(IR0_ERDP_LOW),
+	dump_register(IR0_ERDP_HIGH),
+};
 
-static void xhci_dbgfs_regs(struct xhci_hcd *xhci,
-		char **nextp, unsigned *sizep)
+static const struct debugfs_reg32 xhci_extcap_legsup[] = {
+	dump_register(EXTCAP_USBLEGSUP),
+	dump_register(EXTCAP_USBLEGCTLSTS),
+};
+
+static const struct debugfs_reg32 xhci_extcap_protocol[] = {
+	dump_register(EXTCAP_REVISION),
+	dump_register(EXTCAP_NAME),
+	dump_register(EXTCAP_PORTINFO),
+	dump_register(EXTCAP_PORTTYPE),
+	dump_register(EXTCAP_MANTISSA1),
+	dump_register(EXTCAP_MANTISSA2),
+	dump_register(EXTCAP_MANTISSA3),
+	dump_register(EXTCAP_MANTISSA4),
+	dump_register(EXTCAP_MANTISSA5),
+	dump_register(EXTCAP_MANTISSA6),
+};
+
+static const struct debugfs_reg32 xhci_extcap_dbc[] = {
+	dump_register(EXTCAP_DBC_CAPABILITY),
+	dump_register(EXTCAP_DBC_DOORBELL),
+	dump_register(EXTCAP_DBC_ERSTSIZE),
+	dump_register(EXTCAP_DBC_ERST_LOW),
+	dump_register(EXTCAP_DBC_ERST_HIGH),
+	dump_register(EXTCAP_DBC_ERDP_LOW),
+	dump_register(EXTCAP_DBC_ERDP_HIGH),
+	dump_register(EXTCAP_DBC_CONTROL),
+	dump_register(EXTCAP_DBC_STATUS),
+	dump_register(EXTCAP_DBC_PORTSC),
+	dump_register(EXTCAP_DBC_CONT_LOW),
+	dump_register(EXTCAP_DBC_CONT_HIGH),
+	dump_register(EXTCAP_DBC_DEVINFO1),
+	dump_register(EXTCAP_DBC_DEVINFO2),
+};
+
+static struct dentry *xhci_debugfs_root;
+
+static struct xhci_regset *xhci_debugfs_alloc_regset(struct xhci_hcd *xhci)
 {
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
+	struct xhci_regset	*regset;
 
-	u32 temp;
+	regset = kzalloc(sizeof(*regset), GFP_KERNEL);
+	if (!regset)
+		return NULL;
 
-	inc = snprintf(next, size, "// xHCI capability registers at %p:\n",
-			xhci->cap_regs);
-	TO_NEXT(next, size, inc);
-	temp = readl(&xhci->cap_regs->hc_capbase);
-	inc = snprintf(next, size, "// @%p = 0x%x (CAPLENGTH AND HCIVERSION)\n",
-			&xhci->cap_regs->hc_capbase, temp);
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "//   CAPLENGTH: 0x%x\n",
-			(unsigned int) HC_LENGTH(temp));
-	TO_NEXT(next, size, inc);
-#if 0
-	inc = snprintf(next, size, "//   HCIVERSION: 0x%x\n",
-			(unsigned int) HC_VERSION(temp));
-	TO_NEXT(next, size, inc);
-#endif
+	/*
+	 * The allocation and free of regset are executed in order.
+	 * We needn't a lock here.
+	 */
+	INIT_LIST_HEAD(&regset->list);
+	list_add_tail(&regset->list, &xhci->regset_list);
 
-	inc = snprintf(next, size, "// xHCI operational registers at %p:\n", xhci->op_regs);
-	TO_NEXT(next, size, inc);
-
-	temp = readl(&xhci->cap_regs->run_regs_off);
-	inc = snprintf(next, size, "// @%p = 0x%x RTSOFF\n",
-			&xhci->cap_regs->run_regs_off,
-			(unsigned int) temp & RTSOFF_MASK);
-	TO_NEXT(next, size, inc);
-
-	inc = snprintf(next, size, "// xHCI runtime registers at %p:\n", xhci->run_regs);
-	TO_NEXT(next, size, inc);
-
-	temp = readl(&xhci->cap_regs->db_off);
-	inc = snprintf(next, size, "// @%p = 0x%x DBOFF\n", &xhci->cap_regs->db_off, temp);
-	TO_NEXT(next, size, inc);
-
-	inc = snprintf(next, size, "// Doorbell array at %p:\n", xhci->dba);
-	TO_NEXT(next, size, inc);
-
-done:
-	*sizep = size;
-	*nextp = next;
+	return regset;
 }
 
-static void xhci_dbgfs_print_cap_regs(struct xhci_hcd *xhci,
-		char **nextp, unsigned *sizep)
+static void xhci_debugfs_free_regset(struct xhci_regset *regset)
 {
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
-
-	u32 temp;
-
-	inc = snprintf(next, size, "xHCI capability registers at %p:\n", xhci->cap_regs);
-	TO_NEXT(next, size, inc);
-
-	temp = readl(&xhci->cap_regs->hc_capbase);
-	inc = snprintf(next, size, "CAPLENGTH AND HCIVERSION 0x%x:\n",
-			(unsigned int) temp);
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "CAPLENGTH: 0x%x\n",
-			(unsigned int) HC_LENGTH(temp));
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "HCIVERSION: 0x%x\n",
-			(unsigned int) HC_VERSION(temp));
-	TO_NEXT(next, size, inc);
-
-	temp = readl(&xhci->cap_regs->hcs_params1);
-	inc = snprintf(next, size, "HCSPARAMS 1: 0x%x\n",
-			(unsigned int) temp);
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "  Max device slots: %u\n",
-			(unsigned int) HCS_MAX_SLOTS(temp));
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "  Max interrupters: %u\n",
-			(unsigned int) HCS_MAX_INTRS(temp));
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "  Max ports: %u\n",
-			(unsigned int) HCS_MAX_PORTS(temp));
-	TO_NEXT(next, size, inc);
-
-	temp = readl(&xhci->cap_regs->hcs_params2);
-	inc = snprintf(next, size, "HCSPARAMS 2: 0x%x\n",
-			(unsigned int) temp);
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "  Isoc scheduling threshold: %u\n",
-			(unsigned int) HCS_IST(temp));
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "  Maximum allowed segments in event ring: %u\n",
-			(unsigned int) HCS_ERST_MAX(temp));
-	TO_NEXT(next, size, inc);
-
-	temp = readl(&xhci->cap_regs->hcs_params3);
-	inc = snprintf(next, size, "HCSPARAMS 3 0x%x:\n",
-			(unsigned int) temp);
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "  Worst case U1 device exit latency: %u\n",
-			(unsigned int) HCS_U1_LATENCY(temp));
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "  Worst case U2 device exit latency: %u\n",
-			(unsigned int) HCS_U2_LATENCY(temp));
-	TO_NEXT(next, size, inc);
-
-	temp = readl(&xhci->cap_regs->hcc_params);
-	inc = snprintf(next, size, "HCC PARAMS 0x%x:\n", (unsigned int) temp);
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "  HC generates %s bit addresses\n",
-			HCC_64BIT_ADDR(temp) ? "64" : "32");
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "  FIXME: more HCCPARAMS debugging\n");
-	TO_NEXT(next, size, inc);
-
-	temp = readl(&xhci->cap_regs->run_regs_off);
-	inc = snprintf(next, size, "RTSOFF 0x%x:\n", temp & RTSOFF_MASK);
-	TO_NEXT(next, size, inc);
-
-done:
-	*sizep = size;
-	*nextp = next;
-}
-
-static void xhci_dbgfs_print_command_reg(struct xhci_hcd *xhci,
-		char **nextp, unsigned *sizep)
-{
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
-
-	u32 temp;
-
-	temp = readl(&xhci->op_regs->command);
-	inc = snprintf(next, size, "USBCMD 0x%x:\n", temp);
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "  HC is %s\n",
-			(temp & CMD_RUN) ? "running" : "being stopped");
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "  HC has %sfinished hard reset\n",
-			(temp & CMD_RESET) ? "not " : "");
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "  Event Interrupts %s\n",
-			(temp & CMD_EIE) ? "enabled " : "disabled");
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "  Host System Error Interrupts %s\n",
-			(temp & CMD_HSEIE) ? "enabled " : "disabled");
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "  HC has %sfinished light reset\n",
-			(temp & CMD_LRESET) ? "not " : "");
-	TO_NEXT(next, size, inc);
-
-done:
-	*sizep = size;
-	*nextp = next;
-}
-
-static void xhci_dbgfs_print_status(struct xhci_hcd *xhci,
-		char **nextp, unsigned *sizep)
-{
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
-
-	u32 temp;
-
-	temp = readl(&xhci->op_regs->status);
-	inc = snprintf(next, size, "USBSTS 0x%x:\n", temp);
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "  Event ring is %sempty\n",
-			(temp & STS_EINT) ? "not " : "");
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "  %sHost System Error\n",
-			(temp & STS_FATAL) ? "WARNING: " : "No ");
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "  HC is %s\n",
-			(temp & STS_HALT) ? "halted" : "running");
-	TO_NEXT(next, size, inc);
-
-done:
-	*sizep = size;
-	*nextp = next;
-}
-
-static void xhci_dbgfs_print_op_regs(struct xhci_hcd *xhci,
-		char **nextp, unsigned *sizep)
-{
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
-
-	inc = snprintf(next, size, "xHCI operational registers at %p:\n", xhci->op_regs);
-	TO_NEXT(next, size, inc);
-	xhci_dbgfs_print_command_reg(xhci, &next, &size);
-	xhci_dbgfs_print_status(xhci, &next, &size);
-
-done:
-	*sizep = size;
-	*nextp = next;
-}
-
-static void xhci_dbgfs_print_ports(struct xhci_hcd *xhci,
-		char **nextp, unsigned *sizep)
-{
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
-
-	__le32 __iomem *addr;
-	int i, j;
-	int ports;
-	char *names[NUM_PORT_REGS] = {
-		"status",
-		"power",
-		"link",
-		"reserved",
-	};
-
-	ports = HCS_MAX_PORTS(xhci->hcs_params1);
-	addr = &xhci->op_regs->port_status_base;
-	for (i = 0; i < ports; i++) {
-		for (j = 0; j < NUM_PORT_REGS; ++j) {
-			inc = snprintf(next, size, "%p port %s reg = 0x%x\n",
-					addr, names[j],
-					(unsigned int) readl(addr));
-			TO_NEXT(next, size, inc);
-			addr++;
-		}
-	}
-
-done:
-	*sizep = size;
-	*nextp = next;
-}
-
-static void xhci_dbgfs_print_ir_set(struct xhci_hcd *xhci, int set_num,
-		char **nextp, unsigned *sizep)
-{
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
-
-	struct xhci_intr_reg __iomem *ir_set = &xhci->run_regs->ir_set[set_num];
-	void __iomem *addr;
-	u32 temp;
-	u64 temp_64;
-
-	addr = &ir_set->irq_pending;
-	temp = readl(addr);
-	if (temp == XHCI_INIT_VALUE)
+	if (!regset)
 		return;
 
-	inc = snprintf(next, size, "  %p: ir_set[%i]\n", ir_set, set_num);
-	TO_NEXT(next, size, inc);
-
-	inc = snprintf(next, size, "  %p: ir_set.pending = 0x%x\n", addr,
-			(unsigned int)temp);
-	TO_NEXT(next, size, inc);
-
-	addr = &ir_set->irq_control;
-	temp = readl(addr);
-	inc = snprintf(next, size, "  %p: ir_set.control = 0x%x\n", addr,
-			(unsigned int)temp);
-	TO_NEXT(next, size, inc);
-
-	addr = &ir_set->erst_size;
-	temp = readl(addr);
-	inc = snprintf(next, size, "  %p: ir_set.erst_size = 0x%x\n", addr,
-			(unsigned int)temp);
-	TO_NEXT(next, size, inc);
-
-	addr = &ir_set->rsvd;
-	temp = readl(addr);
-	if (temp != XHCI_INIT_VALUE) {
-		inc = snprintf(next, size, "  WARN: %p: ir_set.rsvd = 0x%x\n",
-				addr, (unsigned int)temp);
-		TO_NEXT(next, size, inc);
-	}
-
-	addr = &ir_set->erst_base;
-	temp_64 = xhci_read_64(xhci, addr);
-	inc = snprintf(next, size, "  %p: ir_set.erst_base = @%08llx\n",
-			addr, temp_64);
-	TO_NEXT(next, size, inc);
-
-	addr = &ir_set->erst_dequeue;
-	temp_64 = xhci_read_64(xhci, addr);
-	inc = snprintf(next, size, "  %p: ir_set.erst_dequeue = @%08llx\n",
-			addr, temp_64);
-	TO_NEXT(next, size, inc);
-
-done:
-	*sizep = size;
-	*nextp = next;
+	list_del(&regset->list);
+	kfree(regset);
 }
 
-static void xhci_dbgfs_print_run_regs(struct xhci_hcd *xhci,
-		char **nextp, unsigned *sizep)
+__printf(6, 7)
+static void xhci_debugfs_regset(struct xhci_hcd *xhci, u32 base,
+				const struct debugfs_reg32 *regs,
+				size_t nregs, struct dentry *parent,
+				const char *fmt, ...)
 {
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
+	struct xhci_regset	*rgs;
+	va_list			args;
+	struct debugfs_regset32	*regset;
+	struct usb_hcd		*hcd = xhci_to_hcd(xhci);
 
-	u32 temp;
-	int i;
+	rgs = xhci_debugfs_alloc_regset(xhci);
+	if (!rgs)
+		return;
 
-	inc = snprintf(next, size, "xHCI runtime registers at %p:\n", xhci->run_regs);
-	TO_NEXT(next, size, inc);
-	temp = readl(&xhci->run_regs->microframe_index);
-	inc = snprintf(next, size, "  %p: Microframe index = 0x%x\n",
-			&xhci->run_regs->microframe_index,
-			(unsigned int) temp);
-	TO_NEXT(next, size, inc);
-	for (i = 0; i < 7; ++i) {
-		temp = readl(&xhci->run_regs->rsvd[i]);
-		if (temp != XHCI_INIT_VALUE) {
-			inc = snprintf(next, size, "  WARN: %p: Rsvd[%i] = 0x%x\n",
-					&xhci->run_regs->rsvd[i],
-					i, (unsigned int) temp);
-			TO_NEXT(next, size, inc);
+	va_start(args, fmt);
+	vsnprintf(rgs->name, sizeof(rgs->name), fmt, args);
+	va_end(args);
+
+	regset = &rgs->regset;
+	regset->regs = regs;
+	regset->nregs = nregs;
+	regset->base = hcd->regs + base;
+
+	debugfs_create_regset32((const char *)rgs->name, 0444, parent, regset);
+}
+
+static void xhci_debugfs_extcap_regset(struct xhci_hcd *xhci, int cap_id,
+				       const struct debugfs_reg32 *regs,
+				       size_t n, const char *cap_name)
+{
+	u32			offset;
+	int			index = 0;
+	size_t			psic, nregs = n;
+	void __iomem		*base = &xhci->cap_regs->hc_capbase;
+
+	offset = xhci_find_next_ext_cap(base, 0, cap_id);
+	while (offset) {
+		if (cap_id == XHCI_EXT_CAPS_PROTOCOL) {
+			psic = XHCI_EXT_PORT_PSIC(readl(base + offset + 8));
+			nregs = min(4 + psic, n);
 		}
+
+		xhci_debugfs_regset(xhci, offset, regs, nregs,
+				    xhci->debugfs_root, "%s:%02d",
+				    cap_name, index);
+		offset = xhci_find_next_ext_cap(base, offset, cap_id);
+		index++;
 	}
-
-done:
-	*sizep = size;
-	*nextp = next;
 }
 
-static void xhci_dbgfs_print_registers(struct xhci_hcd *xhci,
-		char **nextp, unsigned *sizep)
+static int xhci_ring_enqueue_show(struct seq_file *s, void *unused)
 {
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
+	dma_addr_t		dma;
+	struct xhci_ring	*ring = *(struct xhci_ring **)s->private;
 
-	xhci_dbgfs_print_cap_regs(xhci, &next, &size);
-	xhci_dbgfs_print_op_regs(xhci, &next, &size);
-	xhci_dbgfs_print_ports(xhci, &next, &size);
-	xhci_dbgfs_print_run_regs(xhci, &next, &size);
-	xhci_dbgfs_print_ir_set(xhci, 0, &next, &size);
+	dma = xhci_trb_virt_to_dma(ring->enq_seg, ring->enqueue);
+	seq_printf(s, "%pad\n", &dma);
 
-done:
-	*sizep = size;
-	*nextp = next;
+	return 0;
 }
 
-static void xhci_dbgfs_print_trb_offsets(struct xhci_hcd *xhci, union xhci_trb *trb,
-		char **nextp, unsigned *sizep)
+static int xhci_ring_dequeue_show(struct seq_file *s, void *unused)
 {
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
+	dma_addr_t		dma;
+	struct xhci_ring	*ring = *(struct xhci_ring **)s->private;
 
-	int i;
-	for (i = 0; i < 4; ++i) {
-		inc = snprintf(next, size, "Offset 0x%x = 0x%x\n",
-				i*4, trb->generic.field[i]);
-		TO_NEXT(next, size, inc);
-	}
+	dma = xhci_trb_virt_to_dma(ring->deq_seg, ring->dequeue);
+	seq_printf(s, "%pad\n", &dma);
 
-done:
-	*sizep = size;
-	*nextp = next;
+	return 0;
 }
 
-/**
- * Debug a transfer request block (TRB).
- */
-static void xhci_dbgfs_trb(struct xhci_hcd *xhci, union xhci_trb *trb,
-		char **nextp, unsigned *sizep)
+static int xhci_ring_cycle_show(struct seq_file *s, void *unused)
 {
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
+	struct xhci_ring	*ring = *(struct xhci_ring **)s->private;
 
-	u64	address;
-	u32	type = le32_to_cpu(trb->link.control) & TRB_TYPE_BITMASK;
+	seq_printf(s, "%d\n", ring->cycle_state);
 
-	switch (type) {
-	case TRB_TYPE(TRB_LINK):
-		inc = snprintf(next, size, "Link TRB:\n");
-		TO_NEXT(next, size, inc);
-		xhci_dbgfs_print_trb_offsets(xhci, trb, &next, &size);
-
-		address = le64_to_cpu(trb->link.segment_ptr);
-		inc = snprintf(next, size, "Next ring segment DMA address = 0x%llx\n", address);
-		TO_NEXT(next, size, inc);
-
-		inc = snprintf(next, size, "Interrupter target = 0x%x\n",
-			 GET_INTR_TARGET(le32_to_cpu(trb->link.intr_target)));
-		TO_NEXT(next, size, inc);
-		inc = snprintf(next, size, "Cycle bit = %u\n",
-			 le32_to_cpu(trb->link.control) & TRB_CYCLE);
-		TO_NEXT(next, size, inc);
-		inc = snprintf(next, size, "Toggle cycle bit = %u\n",
-			 le32_to_cpu(trb->link.control) & LINK_TOGGLE);
-		TO_NEXT(next, size, inc);
-		inc = snprintf(next, size, "No Snoop bit = %u\n",
-			 le32_to_cpu(trb->link.control) & TRB_NO_SNOOP);
-		TO_NEXT(next, size, inc);
-		break;
-	case TRB_TYPE(TRB_TRANSFER):
-		address = le64_to_cpu(trb->trans_event.buffer);
-		/*
-		 * FIXME: look at flags to figure out if it's an address or if
-		 * the data is directly in the buffer field.
-		 */
-		inc = snprintf(next, size, "DMA address or buffer contents= %llu\n", address);
-		TO_NEXT(next, size, inc);
-		break;
-	case TRB_TYPE(TRB_COMPLETION):
-		address = le64_to_cpu(trb->event_cmd.cmd_trb);
-		inc = snprintf(next, size, "Command TRB pointer = %llu\n", address);
-		TO_NEXT(next, size, inc);
-		inc = snprintf(next, size, "Completion status = %u\n",
-			 GET_COMP_CODE(le32_to_cpu(trb->event_cmd.status)));
-		TO_NEXT(next, size, inc);
-		inc = snprintf(next, size, "Flags = 0x%x\n",
-			 le32_to_cpu(trb->event_cmd.flags));
-		TO_NEXT(next, size, inc);
-		break;
-	default:
-		inc = snprintf(next, size, "Unknown TRB with TRB type ID %u\n",
-				(unsigned int) type>>10);
-		TO_NEXT(next, size, inc);
-		xhci_dbgfs_print_trb_offsets(xhci, trb, &next, &size);
-		break;
-	}
-
-done:
-	*sizep = size;
-	*nextp = next;
+	return 0;
 }
 
-/**
- * Debug a segment with an xHCI ring.
- *
- * @return The Link TRB of the segment, or NULL if there is no Link TRB
- * (which is a bug, since all segments must have a Link TRB).
- *
- * Prints out all TRBs in the segment, even those after the Link TRB.
- *
- * XXX: should we print out TRBs that the HC owns?  As long as we don't
- * write, that should be fine...  We shouldn't expect that the memory pointed to
- * by the TRB is valid at all.  Do we care about ones the HC owns?  Probably,
- * for HC debugging.
- */
-static void xhci_dbgfs_segment(struct xhci_hcd *xhci, struct xhci_segment *seg,
-		char **nextp, unsigned *sizep)
+static void xhci_ring_dump_segment(struct seq_file *s,
+				   struct xhci_segment *seg)
 {
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
+	int			i;
+	dma_addr_t		dma;
+	union xhci_trb		*trb;
 
-	int i;
-	u64 addr = seg->dma;
-	union xhci_trb *trb = seg->trbs;
-
-	for (i = 0; i < TRBS_PER_SEGMENT; ++i) {
+	for (i = 0; i < TRBS_PER_SEGMENT; i++) {
 		trb = &seg->trbs[i];
-		inc = snprintf(next, size, "@%016llx %08x %08x %08x %08x\n", addr,
-			 lower_32_bits(le64_to_cpu(trb->link.segment_ptr)),
-			 upper_32_bits(le64_to_cpu(trb->link.segment_ptr)),
-			 le32_to_cpu(trb->link.intr_target),
-			 le32_to_cpu(trb->link.control));
-		TO_NEXT(next, size, inc);
-		addr += sizeof(*trb);
+		dma = seg->dma + i * sizeof(*trb);
+		seq_printf(s, "%pad: %s\n", &dma,
+			   xhci_decode_trb(le32_to_cpu(trb->generic.field[0]),
+					   le32_to_cpu(trb->generic.field[1]),
+					   le32_to_cpu(trb->generic.field[2]),
+					   le32_to_cpu(trb->generic.field[3])));
 	}
-
-done:
-	*sizep = size;
-	*nextp = next;
 }
 
-static void xhci_dbgfs_ring_ptrs(struct xhci_hcd *xhci, struct xhci_ring *ring,
-		char **nextp, unsigned *sizep)
+static int xhci_ring_trb_show(struct seq_file *s, void *unused)
 {
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
-
-	inc = snprintf(next, size, "Ring deq = %p (virt), 0x%llx (dma)\n",
-			ring->dequeue,
-			(unsigned long long)xhci_trb_virt_to_dma(ring->deq_seg,
-							    ring->dequeue));
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "Ring deq updated %u times\n",
-			ring->deq_updates);
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "Ring enq = %p (virt), 0x%llx (dma)\n",
-			ring->enqueue,
-			(unsigned long long)xhci_trb_virt_to_dma(ring->enq_seg,
-							    ring->enqueue));
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "Ring enq updated %u times\n",
-			ring->enq_updates);
-	TO_NEXT(next, size, inc);
-
-done:
-	*sizep = size;
-	*nextp = next;
-}
-
-/**
- * Debugging for an xHCI ring, which is a queue broken into multiple segments.
- *
- * Print out each segment in the ring.  Check that the DMA address in
- * each link segment actually matches the segment's stored DMA address.
- * Check that the link end bit is only set at the end of the ring.
- * Check that the dequeue and enqueue pointers point to real data in this ring
- * (not some other ring).
- */
-static void xhci_dbgfs_ring(struct xhci_hcd *xhci, struct xhci_ring *ring,
-		char **nextp, unsigned *sizep)
-{
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
-
-	/* FIXME: Throw an error if any segment doesn't have a Link TRB */
-	struct xhci_segment *seg;
-	struct xhci_segment *first_seg = ring->first_seg;
-	xhci_dbgfs_segment(xhci, first_seg, &next, &size);
-
-	if (!ring->enq_updates && !ring->deq_updates) {
-		inc = snprintf(next, size, "  Ring has not been updated\n");
-		TO_NEXT(next, size, inc);
-		goto done;
-	}
-	for (seg = first_seg->next; seg != first_seg; seg = seg->next)
-		xhci_dbgfs_segment(xhci, seg, &next, &size);
-
-done:
-	*sizep = size;
-	*nextp = next;
-}
-
-static void xhci_dbgfs_ep_rings(struct xhci_hcd *xhci,
-		unsigned int slot_id, unsigned int ep_index,
-		struct xhci_virt_ep *ep,
-		char **nextp, unsigned *sizep)
-{
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
-
-	int i;
-	struct xhci_ring *ring;
-
-	if (ep->ep_state & EP_HAS_STREAMS) {
-		for (i = 1; i < ep->stream_info->num_streams; i++) {
-			ring = ep->stream_info->stream_rings[i];
-			inc = snprintf(next, size, "Dev %d endpoint %d stream ID %d:\n",
-				slot_id, ep_index, i);
-			TO_NEXT(next, size, inc);
-			xhci_dbgfs_segment(xhci, ring->deq_seg, &next, &size);
-		}
-	} else {
-		ring = ep->ring;
-		if (!ring)
-			goto done;
-		inc = snprintf(next, size, "Dev %d endpoint ring %d:\n",
-				slot_id, ep_index);
-		TO_NEXT(next, size, inc);
-		xhci_dbgfs_segment(xhci, ring->deq_seg, &next, &size);
-	}
-
-done:
-	*sizep = size;
-	*nextp = next;
-}
-
-static void xhci_dbgfs_erst(struct xhci_hcd *xhci, struct xhci_erst *erst,
-		char **nextp, unsigned *sizep)
-{
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
-
-
-	u64 addr = erst->erst_dma_addr;
-	int i;
-	struct xhci_erst_entry *entry;
-
-	for (i = 0; i < erst->num_entries; ++i) {
-		entry = &erst->entries[i];
-		inc = snprintf(next, size, "@%016llx %08x %08x %08x %08x\n",
-			 addr,
-			 lower_32_bits(le64_to_cpu(entry->seg_addr)),
-			 upper_32_bits(le64_to_cpu(entry->seg_addr)),
-			 le32_to_cpu(entry->seg_size),
-			 le32_to_cpu(entry->rsvd));
-		TO_NEXT(next, size, inc);
-		addr += sizeof(*entry);
-	}
-
-done:
-	*sizep = size;
-	*nextp = next;
-}
-
-static void xhci_dbgfs_cmd_ptrs(struct xhci_hcd *xhci,
-		char **nextp, unsigned *sizep)
-{
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
-
-	u64 val;
-
-	val = xhci_read_64(xhci, &xhci->op_regs->cmd_ring);
-	inc = snprintf(next, size, "// xHC command ring deq ptr low bits + flags = @%08x\n",
-			lower_32_bits(val));
-	TO_NEXT(next, size, inc);
-	inc = snprintf(next, size, "// xHC command ring deq ptr high bits = @%08x\n",
-			upper_32_bits(val));
-	TO_NEXT(next, size, inc);
-
-done:
-	*sizep = size;
-	*nextp = next;
-}
-
-/* Print the last 32 bytes for 64-byte contexts */
-static void dbgfs_rsvd64(struct xhci_hcd *xhci, u64 *ctx, dma_addr_t dma,
-		  char **nextp, unsigned *sizep)
-{
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
-
-	int i;
-	for (i = 0; i < 4; ++i) {
-		inc = snprintf(next, size, "@%p (virt) @%08llx "
-			 "(dma) %#08llx - rsvd64[%d]\n",
-			 &ctx[4 + i], (unsigned long long)dma,
-			 ctx[4 + i], i);
-		TO_NEXT(next, size, inc);
-
-		dma += 8;
-	}
-
-done:
-	*sizep = size;
-	*nextp = next;
-}
-
-static void xhci_dbgfs_slot_ctx(struct xhci_hcd *xhci, struct xhci_container_ctx *ctx,
-		  char **nextp, unsigned *sizep)
-{
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
-
-	/* Fields are 32 bits wide, DMA addresses are in bytes */
-	int field_size = 32 / 8;
-	int i;
-
-	struct xhci_slot_ctx *slot_ctx = xhci_get_slot_ctx(xhci, ctx);
-	dma_addr_t dma = ctx->dma +
-		((unsigned long)slot_ctx - (unsigned long)ctx->bytes);
-	int csz = HCC_64BYTE_CONTEXT(xhci->hcc_params);
-
-	inc = snprintf(next, size, "Slot Context:\n");
-	TO_NEXT(next, size, inc);
-
-	inc = snprintf(next, size, "@%p (virt) @%08llx (dma) %#08x - dev_info\n",
-			&slot_ctx->dev_info,
-			(unsigned long long)dma, slot_ctx->dev_info);
-	TO_NEXT(next, size, inc);
-	dma += field_size;
-	inc = snprintf(next, size, "@%p (virt) @%08llx (dma) %#08x - dev_info2\n",
-			&slot_ctx->dev_info2,
-			(unsigned long long)dma, slot_ctx->dev_info2);
-	TO_NEXT(next, size, inc);
-	dma += field_size;
-	inc = snprintf(next, size, "@%p (virt) @%08llx (dma) %#08x - tt_info\n",
-			&slot_ctx->tt_info,
-			(unsigned long long)dma, slot_ctx->tt_info);
-	TO_NEXT(next, size, inc);
-	dma += field_size;
-	inc = snprintf(next, size, "@%p (virt) @%08llx (dma) %#08x - dev_state\n",
-			&slot_ctx->dev_state,
-			(unsigned long long)dma, slot_ctx->dev_state);
-	TO_NEXT(next, size, inc);
-	dma += field_size;
-	for (i = 0; i < 4; ++i) {
-		inc = snprintf(next, size, "@%p (virt) @%08llx (dma) %#08x - rsvd[%d]\n",
-				&slot_ctx->reserved[i], (unsigned long long)dma,
-				slot_ctx->reserved[i], i);
-		TO_NEXT(next, size, inc);
-		dma += field_size;
-	}
-
-	if (csz)
-		dbgfs_rsvd64(xhci, (u64 *)slot_ctx, dma, &next, &size);
-
-done:
-	*sizep = size;
-	*nextp = next;
-}
-
-static void xhci_dbgfs_ep_ctx(struct xhci_hcd *xhci,
-		     struct xhci_container_ctx *ctx,
-		     unsigned int last_ep,
-		     char **nextp, unsigned *sizep)
-{
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
-
-	int i, j;
-	int last_ep_ctx = 31;
-	/* Fields are 32 bits wide, DMA addresses are in bytes */
-	int field_size = 32 / 8;
-	int csz = HCC_64BYTE_CONTEXT(xhci->hcc_params);
-
-	if (last_ep < 31)
-		last_ep_ctx = last_ep + 1;
-	for (i = 0; i < last_ep_ctx; ++i) {
-		unsigned int epaddr = xhci_get_endpoint_address(i);
-		struct xhci_ep_ctx *ep_ctx = xhci_get_ep_ctx(xhci, ctx, i);
-		dma_addr_t dma = ctx->dma +
-			((unsigned long)ep_ctx - (unsigned long)ctx->bytes);
-
-		inc = snprintf(next, size, "%s Endpoint %02d Context (ep_index %02d):\n",
-				usb_endpoint_out(epaddr) ? "OUT" : "IN",
-				epaddr & USB_ENDPOINT_NUMBER_MASK, i);
-		TO_NEXT(next, size, inc);
-		inc = snprintf(next, size, "@%p (virt) @%08llx (dma) %#08x - ep_info\n",
-				&ep_ctx->ep_info,
-				(unsigned long long)dma, ep_ctx->ep_info);
-		TO_NEXT(next, size, inc);
-		dma += field_size;
-		inc = snprintf(next, size, "@%p (virt) @%08llx (dma) %#08x - ep_info2\n",
-				&ep_ctx->ep_info2,
-				(unsigned long long)dma, ep_ctx->ep_info2);
-		TO_NEXT(next, size, inc);
-		dma += field_size;
-		inc = snprintf(next, size, "@%p (virt) @%08llx (dma) %#08llx - deq\n",
-				&ep_ctx->deq,
-				(unsigned long long)dma, ep_ctx->deq);
-		TO_NEXT(next, size, inc);
-		dma += 2*field_size;
-		inc = snprintf(next, size, "@%p (virt) @%08llx (dma) %#08x - tx_info\n",
-				&ep_ctx->tx_info,
-				(unsigned long long)dma, ep_ctx->tx_info);
-		TO_NEXT(next, size, inc);
-		dma += field_size;
-		for (j = 0; j < 3; ++j) {
-			inc = snprintf(next, size, "@%p (virt) @%08llx (dma) %#08x - rsvd[%d]\n",
-					&ep_ctx->reserved[j],
-					(unsigned long long)dma,
-					ep_ctx->reserved[j], j);
-			TO_NEXT(next, size, inc);
-			dma += field_size;
-		}
-
-		if (csz)
-			dbgfs_rsvd64(xhci, (u64 *)ep_ctx, dma, &next, &size);
-
-	}
-
-done:
-	*sizep = size;
-	*nextp = next;
-}
-
-static void xhci_dbgfs_ctx(struct xhci_hcd *xhci,
-		  struct xhci_container_ctx *ctx,
-		  unsigned int last_ep,
-		  char **nextp, unsigned *sizep)
-{
-	unsigned		inc;
-	unsigned		size = *sizep;
-	char			*next = *nextp;
-	int i;
-	/* Fields are 32 bits wide, DMA addresses are in bytes */
-	int field_size = 32 / 8;
-	dma_addr_t dma = ctx->dma;
-	int csz = HCC_64BYTE_CONTEXT(xhci->hcc_params);
-
-	if (ctx->type == XHCI_CTX_TYPE_INPUT) {
-		struct xhci_input_control_ctx *ctrl_ctx =
-			xhci_get_input_control_ctx(ctx);
-		if (!ctrl_ctx) {
-			inc = snprintf(next, size, "Could not get input context, bad type.\n");
-			TO_NEXT(next, size, inc);
-			goto done;
-		}
-
-		inc = snprintf(next, size, "@%p (virt) @%08llx (dma) %#08x - drop flags\n",
-			 &ctrl_ctx->drop_flags, (unsigned long long)dma,
-			 ctrl_ctx->drop_flags);
-		TO_NEXT(next, size, inc);
-
-		dma += field_size;
-		inc = snprintf(next, size, "@%p (virt) @%08llx (dma) %#08x - add flags\n",
-			 &ctrl_ctx->add_flags, (unsigned long long)dma,
-			 ctrl_ctx->add_flags);
-		TO_NEXT(next, size, inc);
-
-		dma += field_size;
-		for (i = 0; i < 6; ++i) {
-			inc = snprintf(next, size, "@%p (virt) @%08llx (dma) %#08x - rsvd2[%d]\n",
-				 &ctrl_ctx->rsvd2[i], (unsigned long long)dma,
-				 ctrl_ctx->rsvd2[i], i);
-			TO_NEXT(next, size, inc);
-			dma += field_size;
-		}
-
-		if (csz)
-			dbgfs_rsvd64(xhci, (u64 *)ctrl_ctx, dma, &next, &size);
-	}
-
-	xhci_dbgfs_slot_ctx(xhci, ctx, &next, &size);
-	xhci_dbgfs_ep_ctx(xhci, ctx, last_ep, &next, &size);
-
-done:
-	*sizep = size;
-	*nextp = next;
-
-}
-
-#ifdef CONFIG_DYNAMIC_DEBUG
-struct debug_buffer {
-	ssize_t (*fill_func)(struct debug_buffer *);	/* fill method */
-	struct usb_bus *bus;
-	struct mutex mutex;	/* protect filling of buffer */
-	size_t count;		/* number of characters filled into buffer */
-	char *output_buf;
-	size_t alloc_size;
-};
-
-static int debug_slot = MAX_HC_SLOTS;
-
-static ssize_t fill_ep_ring_buffer(struct debug_buffer *buf)
-{
-	struct usb_hcd		*hcd;
-	struct xhci_hcd		*xhci;
-	unsigned long		flags;
-	unsigned		inc, size;
-	char			*next;
-	int i,j;
-	struct xhci_container_ctx *in_ctx, *out_ctx;
-
-	hcd = bus_to_hcd(buf->bus);
-	xhci = hcd_to_xhci (hcd);
-	next = buf->output_buf;
-	size = buf->alloc_size;
-
-	*next = 0;
-
-	/* dumps a snapshot of the async schedule.
-	 * usually empty except for long-term bulk reads, or head.
-	 * one QH per line, and TDs we know about
-	 */
-	spin_lock_irqsave (&xhci->lock, flags);
-	for (i = 0; i < MAX_HC_SLOTS; i++) {
-		if (!xhci->devs[i])
-			continue;
-
-		if (debug_slot != i && debug_slot != MAX_HC_SLOTS)
-			continue;
-
-		in_ctx = xhci->devs[i]->in_ctx;
-		out_ctx = xhci->devs[i]->out_ctx;
-
-		inc = scnprintf(next, size, "Slot %d input context\n", i);
-		TO_NEXT(next, size, inc);
-		xhci_dbgfs_ctx(xhci, in_ctx, XHCI_MAX_RINGS_CACHED, &next, &size);
-
-		inc = scnprintf(next, size, "Slot %d output context\n", i);
-		TO_NEXT(next, size, inc);
-		xhci_dbgfs_ctx(xhci, out_ctx, XHCI_MAX_RINGS_CACHED, &next, &size);
-
-		for (j = 0; j < XHCI_MAX_RINGS_CACHED; j++) {
-			struct xhci_virt_ep *ep = &xhci->devs[i]->eps[j];
-			struct xhci_ring *ep_ring = ep->ring;
-
-			inc = scnprintf(next, size, "Slot %d ep_index %d endpoint ring @%p\n",
-					i, j, ep_ring);
-			TO_NEXT(next, size, inc);
-			if (ep) xhci_dbgfs_ep_rings(xhci, i, j, ep, &next, &size);
-		}
-	}
-
-	spin_unlock_irqrestore (&xhci->lock, flags);
-
-	inc = scnprintf(next, size, "Print Done (buffer use %d/%d bytes)..\n",
-			buf->alloc_size - size, buf->alloc_size);
-	TO_NEXT(next, size, inc);
-
-	return strlen(buf->output_buf);
-}
-
-static ssize_t fill_event_ring_buffer(struct debug_buffer *buf)
-{
-	struct usb_hcd		*hcd;
-	struct xhci_hcd		*xhci;
-	unsigned long		flags;
-	unsigned		inc, size;
-	char			*next;
-	int i,j;
-
-	hcd = bus_to_hcd(buf->bus);
-	xhci = hcd_to_xhci (hcd);
-	next = buf->output_buf;
-	size = buf->alloc_size;
-
-	*next = 0;
-
-	/* dumps a snapshot of the async schedule.
-	 * usually empty except for long-term bulk reads, or head.
-	 * one QH per line, and TDs we know about
-	 */
-	spin_lock_irqsave (&xhci->lock, flags);
-
-	inc = scnprintf(next, size, "ERST memory map follows:\n");
-	TO_NEXT(next, size, inc);
-
-	xhci_dbgfs_erst(xhci, &xhci->erst, &next, &size);
-
-	inc = scnprintf(next, size, "Dump Event Ring @%p\n", xhci->event_ring);
-	TO_NEXT(next, size, inc);
-
-	xhci_dbgfs_ring_ptrs(xhci, xhci->event_ring, &next, &size);
-
-	xhci_dbgfs_ring(xhci, xhci->event_ring, &next, &size);
-
-	spin_unlock_irqrestore (&xhci->lock, flags);
-
-	inc = scnprintf(next, size, "Print Done (buffer use %d/%d bytes)..\n",
-			buf->alloc_size - size, buf->alloc_size);
-	TO_NEXT(next, size, inc);
-
-	return strlen(buf->output_buf);
-}
-
-static ssize_t fill_cmd_ring_buffer(struct debug_buffer *buf)
-{
-	struct usb_hcd		*hcd;
-	struct xhci_hcd		*xhci;
-	unsigned long		flags;
-	unsigned		inc, size;
-	char			*next;
-	int i,j;
-
-	hcd = bus_to_hcd(buf->bus);
-	xhci = hcd_to_xhci (hcd);
-	next = buf->output_buf;
-	size = buf->alloc_size;
-
-	*next = 0;
-
-	/* dumps a snapshot of the async schedule.
-	 * usually empty except for long-term bulk reads, or head.
-	 * one QH per line, and TDs we know about
-	 */
-	spin_lock_irqsave (&xhci->lock, flags);
-
-	inc = scnprintf(next, size, "Dump Command Ring @%p\n", xhci->cmd_ring);
-	TO_NEXT(next, size, inc);
-
-	xhci_dbgfs_ring_ptrs(xhci, xhci->cmd_ring, &next, &size);
-	xhci_dbgfs_cmd_ptrs(xhci, &next, &size);
-	xhci_dbgfs_ring(xhci, xhci->cmd_ring, &next, &size);
-
-	spin_unlock_irqrestore (&xhci->lock, flags);
-
-	inc = scnprintf(next, size, "Print Done (buffer use %d/%d bytes)..\n",
-			buf->alloc_size - size, buf->alloc_size);
-	TO_NEXT(next, size, inc);
-
-	return strlen(buf->output_buf);
-}
-
-static ssize_t fill_context_buffer(struct debug_buffer *buf)
-{
-	struct usb_hcd		*hcd;
-	struct xhci_hcd		*xhci;
-	unsigned long		flags;
-	unsigned		inc, size;
-	char			*next;
-	int i,j;
-	struct xhci_container_ctx *in_ctx, *out_ctx;
-
-	hcd = bus_to_hcd(buf->bus);
-	xhci = hcd_to_xhci (hcd);
-	next = buf->output_buf;
-	size = buf->alloc_size;
-
-	*next = 0;
-
-	/* dumps a snapshot of the async schedule.
-	 * usually empty except for long-term bulk reads, or head.
-	 * one QH per line, and TDs we know about
-	 */
-	spin_lock_irqsave (&xhci->lock, flags);
-	for (i = 0; i < MAX_HC_SLOTS; i++) {
-		if (!xhci->devs[i])
-			continue;
-
-		if (debug_slot != i && debug_slot != MAX_HC_SLOTS)
-			continue;
-
-		in_ctx = xhci->devs[i]->in_ctx;
-		out_ctx = xhci->devs[i]->out_ctx;
-
-		inc = scnprintf(next, size, "Slot %d input context\n", i);
-		TO_NEXT(next, size, inc);
-		xhci_dbgfs_ctx(xhci, in_ctx, XHCI_MAX_RINGS_CACHED, &next, &size);
-
-		inc = scnprintf(next, size, "Slot %d output context\n", i);
-		TO_NEXT(next, size, inc);
-		xhci_dbgfs_ctx(xhci, out_ctx, XHCI_MAX_RINGS_CACHED, &next, &size);
-
-	}
-	spin_unlock_irqrestore (&xhci->lock, flags);
-
-	inc = scnprintf(next, size, "Print Done (buffer use %d/%d bytes)..\n",
-			buf->alloc_size - size, buf->alloc_size);
-	TO_NEXT(next, size, inc);
-
-	return strlen(buf->output_buf);
-}
-
-static ssize_t fill_registers_buffer(struct debug_buffer *buf)
-{
-	struct usb_hcd		*hcd;
-	struct xhci_hcd		*xhci;
-	unsigned long		flags;
-	unsigned		inc, size;
-	char			*next;
-	int i,j;
-	struct xhci_container_ctx *in_ctx, *out_ctx;
-
-	hcd = bus_to_hcd(buf->bus);
-	xhci = hcd_to_xhci (hcd);
-	next = buf->output_buf;
-	size = buf->alloc_size;
-
-	*next = 0;
-
-	/* dumps a snapshot of the async schedule.
-	 * usually empty except for long-term bulk reads, or head.
-	 * one QH per line, and TDs we know about
-	 */
-	spin_lock_irqsave (&xhci->lock, flags);
-
-	xhci_dbgfs_print_registers(xhci, &next, &size);
-
-	spin_unlock_irqrestore (&xhci->lock, flags);
-
-	inc = scnprintf(next, size, "Print Done (buffer use %d/%d bytes)..\n",
-			buf->alloc_size - size, buf->alloc_size);
-	TO_NEXT(next, size, inc);
-
-	return strlen(buf->output_buf);
-}
-
-static ssize_t fill_dump_all_buffer(struct debug_buffer *buf)
-{
-	struct usb_hcd		*hcd;
-	struct xhci_hcd		*xhci;
-	unsigned long		flags;
-	unsigned		inc, size;
-	char			*next;
-	int i,j;
-	struct xhci_container_ctx *in_ctx, *out_ctx;
-
-	hcd = bus_to_hcd(buf->bus);
-	xhci = hcd_to_xhci (hcd);
-	next = buf->output_buf;
-	size = buf->alloc_size;
-
-	*next = 0;
-
-	/* dumps a snapshot of the async schedule.
-	 * usually empty except for long-term bulk reads, or head.
-	 * one QH per line, and TDs we know about
-	 */
-	spin_lock_irqsave (&xhci->lock, flags);
-
-	xhci_dbgfs_print_registers(xhci, &next, &size);
-
-	inc = scnprintf(next, size, "Dump Command Ring @%p\n", xhci->cmd_ring);
-	TO_NEXT(next, size, inc);
-
-	xhci_dbgfs_ring_ptrs(xhci, xhci->cmd_ring, &next, &size);
-	xhci_dbgfs_cmd_ptrs(xhci, &next, &size);
-	xhci_dbgfs_ring(xhci, xhci->cmd_ring, &next, &size);
-
-
-	inc = scnprintf(next, size, "ERST memory map follows:\n");
-	TO_NEXT(next, size, inc);
-
-	xhci_dbgfs_erst(xhci, &xhci->erst, &next, &size);
-
-	inc = scnprintf(next, size, "Dump Event Ring @%p\n", xhci->event_ring);
-	TO_NEXT(next, size, inc);
-
-	xhci_dbgfs_ring_ptrs(xhci, xhci->event_ring, &next, &size);
-
-	xhci_dbgfs_ring(xhci, xhci->event_ring, &next, &size);
-
-	for (i = 0; i < MAX_HC_SLOTS; i++) {
-		if (!xhci->devs[i])
-			continue;
-		in_ctx = xhci->devs[i]->in_ctx;
-		out_ctx = xhci->devs[i]->out_ctx;
-
-		inc = scnprintf(next, size, "Slot %d input context\n", i);
-		TO_NEXT(next, size, inc);
-		xhci_dbgfs_ctx(xhci, in_ctx, XHCI_MAX_RINGS_CACHED, &next, &size);
-
-		inc = scnprintf(next, size, "Slot %d output context\n", i);
-		TO_NEXT(next, size, inc);
-		xhci_dbgfs_ctx(xhci, out_ctx, XHCI_MAX_RINGS_CACHED, &next, &size);
-
-		for (j = 0; j < XHCI_MAX_RINGS_CACHED; j++) {
-			struct xhci_virt_ep *ep = &xhci->devs[i]->eps[j];
-			struct xhci_ring *ep_ring = ep->ring;
-
-			inc = scnprintf(next, size, "Slot %d ep_index %d endpoint ring @%p\n",
-					i, j, ep_ring);
-			TO_NEXT(next, size, inc);
-			if (ep) xhci_dbgfs_ep_rings(xhci, i, j, ep, &next, &size);
-		}
-	}
-
-	spin_unlock_irqrestore (&xhci->lock, flags);
-
-	inc = scnprintf(next, size, "Print Done (buffer use %d/%d bytes)..\n",
-			buf->alloc_size - size, buf->alloc_size);
-	TO_NEXT(next, size, inc);
-
-	return strlen(buf->output_buf);
-}
-
-/* troubleshooting help: expose state in debugfs */
-
-static int debug_ep_ring_open(struct inode *, struct file *);
-static int debug_event_ring_open(struct inode *, struct file *);
-static int debug_cmd_ring_open(struct inode *, struct file *);
-static int debug_context_open(struct inode *, struct file *);
-static int debug_registers_open(struct inode *, struct file *);
-static int debug_dump_all_open(struct inode *, struct file *);
-
-static ssize_t debug_output(struct file*, char __user*, size_t, loff_t*);
-static int debug_close(struct inode *, struct file *);
-
-static ssize_t debug_set_slot_write(struct file *file,
-		const char __user *ubuf, size_t count, loff_t *ppos);
-
-static const struct file_operations debug_ep_ring_fops = {
-	.owner		= THIS_MODULE,
-	.open		= debug_ep_ring_open,
-	.read		= debug_output,
-	.write		= debug_set_slot_write,
-	.release	= debug_close,
-	.llseek		= default_llseek,
-};
-static const struct file_operations debug_event_ring_fops = {
-	.owner		= THIS_MODULE,
-	.open		= debug_event_ring_open,
-	.read		= debug_output,
-	.release	= debug_close,
-	.llseek		= default_llseek,
-};
-static const struct file_operations debug_cmd_ring_fops = {
-	.owner		= THIS_MODULE,
-	.open		= debug_cmd_ring_open,
-	.read		= debug_output,
-	.release	= debug_close,
-	.llseek		= default_llseek,
-};
-static const struct file_operations debug_context_fops = {
-	.owner		= THIS_MODULE,
-	.open		= debug_context_open,
-	.read		= debug_output,
-	.write		= debug_set_slot_write,
-	.release	= debug_close,
-	.llseek		= default_llseek,
-};
-static const struct file_operations debug_registers_fops = {
-	.owner		= THIS_MODULE,
-	.open		= debug_registers_open,
-	.read		= debug_output,
-	.release	= debug_close,
-	.llseek		= default_llseek,
-};
-static const struct file_operations debug_dump_all_fops = {
-	.owner		= THIS_MODULE,
-	.open		= debug_dump_all_open,
-	.read		= debug_output,
-	.release	= debug_close,
-	.llseek		= default_llseek,
-};
-
-static struct debug_buffer *alloc_buffer(struct usb_bus *bus,
-				ssize_t (*fill_func)(struct debug_buffer *))
-{
-	struct debug_buffer *buf;
-
-	buf = kzalloc(sizeof(struct debug_buffer), GFP_KERNEL);
-
-	if (buf) {
-		buf->bus = bus;
-		buf->fill_func = fill_func;
-		mutex_init(&buf->mutex);
-		buf->alloc_size = 100*PAGE_SIZE;
-	}
-
-	return buf;
-}
-
-static int fill_buffer(struct debug_buffer *buf)
-{
-	int ret = 0;
-
-	if (!buf->output_buf)
-		buf->output_buf = vmalloc(buf->alloc_size);
-
-	if (!buf->output_buf) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	ret = buf->fill_func(buf);
-
-	if (ret >= 0) {
-		buf->count = ret;
-		ret = 0;
-	}
-
-out:
-	return ret;
-}
-
-static ssize_t debug_output(struct file *file, char __user *user_buf,
-			    size_t len, loff_t *offset)
-{
-	struct debug_buffer *buf = file->private_data;
-	int ret = 0;
-
-	mutex_lock(&buf->mutex);
-	if (buf->count == 0) {
-		ret = fill_buffer(buf);
-		if (ret != 0) {
-			mutex_unlock(&buf->mutex);
-			goto out;
-		}
-	}
-	mutex_unlock(&buf->mutex);
-
-	ret = simple_read_from_buffer(user_buf, len, offset,
-				      buf->output_buf, buf->count);
-
-out:
-	return ret;
-}
-
-static int debug_close(struct inode *inode, struct file *file)
-{
-	struct debug_buffer *buf = file->private_data;
-
-	if (buf) {
-		vfree(buf->output_buf);
-		kfree(buf);
+	int			i;
+	struct xhci_ring	*ring = *(struct xhci_ring **)s->private;
+	struct xhci_segment	*seg = ring->first_seg;
+
+	for (i = 0; i < ring->num_segs; i++) {
+		xhci_ring_dump_segment(s, seg);
+		seg = seg->next;
 	}
 
 	return 0;
 }
 
-static int debug_ep_ring_open(struct inode *inode, struct file *file)
-{
-	file->private_data = alloc_buffer(inode->i_private, fill_ep_ring_buffer);
+static struct xhci_file_map ring_files[] = {
+	{"enqueue",		xhci_ring_enqueue_show, },
+	{"dequeue",		xhci_ring_dequeue_show, },
+	{"cycle",		xhci_ring_cycle_show, },
+	{"trbs",		xhci_ring_trb_show, },
+};
 
-	return file->private_data ? 0 : -ENOMEM;
+static int xhci_ring_open(struct inode *inode, struct file *file)
+{
+	int			i;
+	struct xhci_file_map	*f_map;
+	const char		*file_name = file_dentry(file)->d_iname;
+
+	for (i = 0; i < ARRAY_SIZE(ring_files); i++) {
+		f_map = &ring_files[i];
+
+		if (strcmp(f_map->name, file_name) == 0)
+			break;
+	}
+
+	return single_open(file, f_map->show, inode->i_private);
 }
 
-static ssize_t debug_set_slot_write(struct file *file,
-		const char __user *ubuf, size_t count, loff_t *ppos)
+static const struct file_operations xhci_ring_fops = {
+	.open			= xhci_ring_open,
+	.read			= seq_read,
+	.llseek			= seq_lseek,
+	.release		= single_release,
+};
+
+static int xhci_slot_context_show(struct seq_file *s, void *unused)
 {
-	static struct dentry *reg_file = NULL;
-	struct debug_buffer *dbuf = file->private_data;
-	char			buf[32];
-	int 			ret;
+	struct xhci_hcd		*xhci;
+	struct xhci_slot_ctx	*slot_ctx;
+	struct xhci_slot_priv	*priv = s->private;
+	struct xhci_virt_device	*dev = priv->dev;
+
+	xhci = hcd_to_xhci(bus_to_hcd(dev->udev->bus));
+	slot_ctx = xhci_get_slot_ctx(xhci, dev->out_ctx);
+	seq_printf(s, "%pad: %s\n", &dev->out_ctx->dma,
+		   xhci_decode_slot_context(le32_to_cpu(slot_ctx->dev_info),
+					    le32_to_cpu(slot_ctx->dev_info2),
+					    le32_to_cpu(slot_ctx->tt_info),
+					    le32_to_cpu(slot_ctx->dev_state)));
+
+	return 0;
+}
+
+static int xhci_endpoint_context_show(struct seq_file *s, void *unused)
+{
+	int			ep_index;
+	dma_addr_t		dma;
+	struct xhci_hcd		*xhci;
+	struct xhci_ep_ctx	*ep_ctx;
+	struct xhci_slot_priv	*priv = s->private;
+	struct xhci_virt_device	*dev = priv->dev;
+
+	xhci = hcd_to_xhci(bus_to_hcd(dev->udev->bus));
+
+	for (ep_index = 0; ep_index < 31; ep_index++) {
+		ep_ctx = xhci_get_ep_ctx(xhci, dev->out_ctx, ep_index);
+		dma = dev->out_ctx->dma + (ep_index + 1) * CTX_SIZE(xhci->hcc_params);
+		seq_printf(s, "%pad: %s\n", &dma,
+			   xhci_decode_ep_context(le32_to_cpu(ep_ctx->ep_info),
+						  le32_to_cpu(ep_ctx->ep_info2),
+						  le64_to_cpu(ep_ctx->deq),
+						  le32_to_cpu(ep_ctx->tx_info)));
+	}
+
+	return 0;
+}
+
+static int xhci_device_name_show(struct seq_file *s, void *unused)
+{
+	struct xhci_slot_priv	*priv = s->private;
+	struct xhci_virt_device	*dev = priv->dev;
+
+	seq_printf(s, "%s\n", dev_name(&dev->udev->dev));
+
+	return 0;
+}
+
+static struct xhci_file_map context_files[] = {
+	{"name",		xhci_device_name_show, },
+	{"slot-context",	xhci_slot_context_show, },
+	{"ep-context",		xhci_endpoint_context_show, },
+};
+
+static int xhci_context_open(struct inode *inode, struct file *file)
+{
+	int			i;
+	struct xhci_file_map	*f_map;
+	const char		*file_name = file_dentry(file)->d_iname;
+
+	for (i = 0; i < ARRAY_SIZE(context_files); i++) {
+		f_map = &context_files[i];
+
+		if (strcmp(f_map->name, file_name) == 0)
+			break;
+	}
+
+	return single_open(file, f_map->show, inode->i_private);
+}
+
+static const struct file_operations xhci_context_fops = {
+	.open			= xhci_context_open,
+	.read			= seq_read,
+	.llseek			= seq_lseek,
+	.release		= single_release,
+};
+
+
+
+static int xhci_portsc_show(struct seq_file *s, void *unused)
+{
+	struct xhci_port	*port = s->private;
+	u32			portsc;
+
+	portsc = readl(port->addr);
+	seq_printf(s, "%s\n", xhci_decode_portsc(portsc));
+
+	return 0;
+}
+
+static int xhci_port_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, xhci_portsc_show, inode->i_private);
+}
+
+static ssize_t xhci_port_write(struct file *file,  const char __user *ubuf,
+			       size_t count, loff_t *ppos)
+{
+	struct seq_file         *s = file->private_data;
+	struct xhci_port	*port = s->private;
+	struct xhci_hcd		*xhci = hcd_to_xhci(port->rhub->hcd);
+	char                    buf[32];
+	u32			portsc;
+	unsigned long		flags;
 
 	if (copy_from_user(&buf, ubuf, min_t(size_t, sizeof(buf) - 1, count)))
 		return -EFAULT;
 
-	if (!strncmp(buf, "all", 3)) {
-		debug_slot = MAX_HC_SLOTS;
-	} else {
-		int id;
-		ret = sscanf(buf, "%d", &id);
-		if (ret >= 1 && id >= 0 && id <= MAX_HC_SLOTS) {
-			debug_slot = id;
-		} else {
-			pr_err("Error: to set slot id = %d (MAX = %d)\n", id, MAX_HC_SLOTS);
+	if (!strncmp(buf, "compliance", 10)) {
+		/* If CTC is clear, compliance is enabled by default */
+		if (!HCC2_CTC(xhci->hcc_params2))
+			return count;
+		spin_lock_irqsave(&xhci->lock, flags);
+		/* compliance mode can only be enabled on ports in RxDetect */
+		portsc = readl(port->addr);
+		if ((portsc & PORT_PLS_MASK) != XDEV_RXDETECT) {
+			spin_unlock_irqrestore(&xhci->lock, flags);
+			return -EPERM;
 		}
+		portsc = xhci_port_state_to_neutral(portsc);
+		portsc &= ~PORT_PLS_MASK;
+		portsc |= PORT_LINK_STROBE | XDEV_COMP_MODE;
+		writel(portsc, port->addr);
+		spin_unlock_irqrestore(&xhci->lock, flags);
+	} else {
+		return -EINVAL;
 	}
+	return count;
+}
+
+static const struct file_operations port_fops = {
+	.open			= xhci_port_open,
+	.write                  = xhci_port_write,
+	.read			= seq_read,
+	.llseek			= seq_lseek,
+	.release		= single_release,
+};
+
+static void xhci_debugfs_create_files(struct xhci_hcd *xhci,
+				      struct xhci_file_map *files,
+				      size_t nentries, void *data,
+				      struct dentry *parent,
+				      const struct file_operations *fops)
+{
+	int			i;
+
+	for (i = 0; i < nentries; i++)
+		debugfs_create_file(files[i].name, 0444, parent, data, fops);
+}
+
+static struct dentry *xhci_debugfs_create_ring_dir(struct xhci_hcd *xhci,
+						   struct xhci_ring **ring,
+						   const char *name,
+						   struct dentry *parent)
+{
+	struct dentry		*dir;
+
+	dir = debugfs_create_dir(name, parent);
+	xhci_debugfs_create_files(xhci, ring_files, ARRAY_SIZE(ring_files),
+				  ring, dir, &xhci_ring_fops);
+
+	return dir;
+}
+
+static void xhci_debugfs_create_context_files(struct xhci_hcd *xhci,
+					      struct dentry *parent,
+					      int slot_id)
+{
+	struct xhci_virt_device	*dev = xhci->devs[slot_id];
+
+	xhci_debugfs_create_files(xhci, context_files,
+				  ARRAY_SIZE(context_files),
+				  dev->debugfs_private,
+				  parent, &xhci_context_fops);
+}
+
+void xhci_debugfs_create_endpoint(struct xhci_hcd *xhci,
+				  struct xhci_virt_device *dev,
+				  int ep_index)
+{
+	struct xhci_ep_priv	*epriv;
+	struct xhci_slot_priv	*spriv = dev->debugfs_private;
+
+	if (!spriv)
+		return;
+
+	if (spriv->eps[ep_index])
+		return;
+
+	epriv = kzalloc(sizeof(*epriv), GFP_KERNEL);
+	if (!epriv)
+		return;
+
+	epriv->show_ring = dev->eps[ep_index].ring;
+
+	snprintf(epriv->name, sizeof(epriv->name), "ep%02d", ep_index);
+	epriv->root = xhci_debugfs_create_ring_dir(xhci,
+						   &epriv->show_ring,
+						   epriv->name,
+						   spriv->root);
+	spriv->eps[ep_index] = epriv;
+}
+
+void xhci_debugfs_remove_endpoint(struct xhci_hcd *xhci,
+				  struct xhci_virt_device *dev,
+				  int ep_index)
+{
+	struct xhci_ep_priv	*epriv;
+	struct xhci_slot_priv	*spriv = dev->debugfs_private;
+
+	if (!spriv || !spriv->eps[ep_index])
+		return;
+
+	epriv = spriv->eps[ep_index];
+	debugfs_remove_recursive(epriv->root);
+	spriv->eps[ep_index] = NULL;
+	kfree(epriv);
+}
+
+static int xhci_stream_id_show(struct seq_file *s, void *unused)
+{
+	struct xhci_ep_priv	*epriv = s->private;
+
+	if (!epriv->stream_info)
+		return -EPERM;
+
+	seq_printf(s, "Show stream ID %d trb ring, supported [1 - %d]\n",
+		   epriv->stream_id, epriv->stream_info->num_streams - 1);
+
+	return 0;
+}
+
+static int xhci_stream_id_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, xhci_stream_id_show, inode->i_private);
+}
+
+static ssize_t xhci_stream_id_write(struct file *file,  const char __user *ubuf,
+			       size_t count, loff_t *ppos)
+{
+	struct seq_file         *s = file->private_data;
+	struct xhci_ep_priv	*epriv = s->private;
+	int			ret;
+	u16			stream_id; /* MaxPStreams + 1 <= 16 */
+
+	if (!epriv->stream_info)
+		return -EPERM;
+
+	/* Decimal number */
+	ret = kstrtou16_from_user(ubuf, count, 10, &stream_id);
+	if (ret)
+		return ret;
+
+	if (stream_id == 0 || stream_id >= epriv->stream_info->num_streams)
+		return -EINVAL;
+
+	epriv->stream_id = stream_id;
+	epriv->show_ring = epriv->stream_info->stream_rings[stream_id];
 
 	return count;
 }
 
-static int debug_event_ring_open(struct inode *inode, struct file *file)
+static const struct file_operations stream_id_fops = {
+	.open			= xhci_stream_id_open,
+	.write                  = xhci_stream_id_write,
+	.read			= seq_read,
+	.llseek			= seq_lseek,
+	.release		= single_release,
+};
+
+static int xhci_stream_context_array_show(struct seq_file *s, void *unused)
 {
-	file->private_data = alloc_buffer(inode->i_private, fill_event_ring_buffer);
+	struct xhci_ep_priv	*epriv = s->private;
+	struct xhci_stream_ctx	*stream_ctx;
+	dma_addr_t		dma;
+	int			id;
 
-	return file->private_data ? 0 : -ENOMEM;
-}
+	if (!epriv->stream_info)
+		return -EPERM;
 
-static int debug_cmd_ring_open(struct inode *inode, struct file *file)
-{
-	file->private_data = alloc_buffer(inode->i_private, fill_cmd_ring_buffer);
+	seq_printf(s, "Allocated %d streams and %d stream context array entries\n",
+			epriv->stream_info->num_streams,
+			epriv->stream_info->num_stream_ctxs);
 
-	return file->private_data ? 0 : -ENOMEM;
-}
-
-static int debug_context_open(struct inode *inode, struct file *file)
-{
-	file->private_data = alloc_buffer(inode->i_private, fill_context_buffer);
-
-	return file->private_data ? 0 : -ENOMEM;
-}
-
-static int debug_registers_open(struct inode *inode, struct file *file)
-{
-	file->private_data = alloc_buffer(inode->i_private, fill_registers_buffer);
-
-	return file->private_data ? 0 : -ENOMEM;
-}
-
-static int debug_dump_all_open(struct inode *inode, struct file *file)
-{
-	file->private_data = alloc_buffer(inode->i_private, fill_dump_all_buffer);
-
-	return file->private_data ? 0 : -ENOMEM;
-}
-
-void create_xhci_debug_files(struct xhci_hcd *xhci)
-{
-	struct usb_bus *bus = &xhci_to_hcd(xhci)->self;
-
-	if (!xhci_debug_root) {
-		xhci_debug_root = debugfs_create_dir("xhci", usb_debug_root);
-		if (!xhci_debug_root) {
-			xhci_err(xhci, "Create debugfs dir xhci Fail\n");
-			return;
-		}
+	for (id = 0; id < epriv->stream_info->num_stream_ctxs; id++) {
+		stream_ctx = epriv->stream_info->stream_ctx_array + id;
+		dma = epriv->stream_info->ctx_array_dma + id * 16;
+		if (id < epriv->stream_info->num_streams)
+			seq_printf(s, "%pad stream id %d deq %016llx\n", &dma,
+				   id, le64_to_cpu(stream_ctx->stream_ring));
+		else
+			seq_printf(s, "%pad stream context entry not used deq %016llx\n",
+				   &dma, le64_to_cpu(stream_ctx->stream_ring));
 	}
 
-	xhci->debug_dir = debugfs_create_dir(bus->bus_name, xhci_debug_root);
-	if (!xhci->debug_dir)
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(xhci_stream_context_array);
+
+void xhci_debugfs_create_stream_files(struct xhci_hcd *xhci,
+				      struct xhci_virt_device *dev,
+				      int ep_index)
+{
+	struct xhci_slot_priv	*spriv = dev->debugfs_private;
+	struct xhci_ep_priv	*epriv;
+
+	if (!spriv || !spriv->eps[ep_index] ||
+	    !dev->eps[ep_index].stream_info)
 		return;
 
-	if (!debugfs_create_file("ep_ring", S_IRUGO | S_IWUSR, xhci->debug_dir, bus,
-						&debug_ep_ring_fops))
-		goto file_error;
+	epriv = spriv->eps[ep_index];
+	epriv->stream_info = dev->eps[ep_index].stream_info;
 
-	if (!debugfs_create_file("event_ring", S_IRUGO, xhci->debug_dir, bus,
-						&debug_event_ring_fops))
-		goto file_error;
-
-	if (!debugfs_create_file("cmd_ring", S_IRUGO, xhci->debug_dir, bus,
-						&debug_cmd_ring_fops))
-		goto file_error;
-
-	if (!debugfs_create_file("context", S_IRUGO | S_IWUSR, xhci->debug_dir, bus,
-						&debug_context_fops))
-		goto file_error;
-
-	if (!debugfs_create_file("registers", S_IRUGO, xhci->debug_dir, bus,
-						    &debug_registers_fops))
-		goto file_error;
-
-	if (!debugfs_create_file("dump_all", S_IRUGO, xhci->debug_dir, bus,
-						&debug_dump_all_fops))
-		goto file_error;
-
-	return;
-
-file_error:
-	debugfs_remove_recursive(xhci->debug_dir);
+	/* Show trb ring of stream ID 1 by default */
+	epriv->stream_id = 1;
+	epriv->show_ring = epriv->stream_info->stream_rings[1];
+	debugfs_create_file("stream_id", 0644,
+			    epriv->root, epriv,
+			    &stream_id_fops);
+	debugfs_create_file("stream_context_array", 0444,
+			    epriv->root, epriv,
+			    &xhci_stream_context_array_fops);
 }
 
-void remove_xhci_debug_files(struct xhci_hcd *xhci)
+void xhci_debugfs_create_slot(struct xhci_hcd *xhci, int slot_id)
 {
-	if (xhci->debug_dir) {
-		debugfs_remove_recursive(xhci->debug_dir);
-		xhci->debug_dir = NULL;
+	struct xhci_slot_priv	*priv;
+	struct xhci_virt_device	*dev = xhci->devs[slot_id];
+
+	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return;
+
+	snprintf(priv->name, sizeof(priv->name), "%02d", slot_id);
+	priv->root = debugfs_create_dir(priv->name, xhci->debugfs_slots);
+	priv->dev = dev;
+	dev->debugfs_private = priv;
+
+	xhci_debugfs_create_ring_dir(xhci, &dev->eps[0].ring,
+				     "ep00", priv->root);
+
+	xhci_debugfs_create_context_files(xhci, priv->root, slot_id);
+}
+
+void xhci_debugfs_remove_slot(struct xhci_hcd *xhci, int slot_id)
+{
+	int			i;
+	struct xhci_slot_priv	*priv;
+	struct xhci_virt_device	*dev = xhci->devs[slot_id];
+
+	if (!dev || !dev->debugfs_private)
+		return;
+
+	priv = dev->debugfs_private;
+
+	debugfs_remove_recursive(priv->root);
+
+	for (i = 0; i < 31; i++)
+		kfree(priv->eps[i]);
+
+	kfree(priv);
+	dev->debugfs_private = NULL;
+}
+
+static void xhci_debugfs_create_ports(struct xhci_hcd *xhci,
+				      struct dentry *parent)
+{
+	unsigned int		num_ports;
+	char			port_name[8];
+	struct xhci_port	*port;
+	struct dentry		*dir;
+
+	num_ports = HCS_MAX_PORTS(xhci->hcs_params1);
+
+	parent = debugfs_create_dir("ports", parent);
+
+	while (num_ports--) {
+		scnprintf(port_name, sizeof(port_name), "port%02d",
+			  num_ports + 1);
+		dir = debugfs_create_dir(port_name, parent);
+		port = &xhci->hw_ports[num_ports];
+		debugfs_create_file("portsc", 0644, dir, port, &port_fops);
 	}
 }
-#endif
+
+void xhci_debugfs_init(struct xhci_hcd *xhci)
+{
+	struct device		*dev = xhci_to_hcd(xhci)->self.controller;
+
+	xhci->debugfs_root = debugfs_create_dir(dev_name(dev),
+						xhci_debugfs_root);
+
+	INIT_LIST_HEAD(&xhci->regset_list);
+
+	xhci_debugfs_regset(xhci,
+			    0,
+			    xhci_cap_regs, ARRAY_SIZE(xhci_cap_regs),
+			    xhci->debugfs_root, "reg-cap");
+
+	xhci_debugfs_regset(xhci,
+			    HC_LENGTH(readl(&xhci->cap_regs->hc_capbase)),
+			    xhci_op_regs, ARRAY_SIZE(xhci_op_regs),
+			    xhci->debugfs_root, "reg-op");
+
+	xhci_debugfs_regset(xhci,
+			    readl(&xhci->cap_regs->run_regs_off) & RTSOFF_MASK,
+			    xhci_runtime_regs, ARRAY_SIZE(xhci_runtime_regs),
+			    xhci->debugfs_root, "reg-runtime");
+
+	xhci_debugfs_extcap_regset(xhci, XHCI_EXT_CAPS_LEGACY,
+				   xhci_extcap_legsup,
+				   ARRAY_SIZE(xhci_extcap_legsup),
+				   "reg-ext-legsup");
+
+	xhci_debugfs_extcap_regset(xhci, XHCI_EXT_CAPS_PROTOCOL,
+				   xhci_extcap_protocol,
+				   ARRAY_SIZE(xhci_extcap_protocol),
+				   "reg-ext-protocol");
+
+	xhci_debugfs_extcap_regset(xhci, XHCI_EXT_CAPS_DEBUG,
+				   xhci_extcap_dbc,
+				   ARRAY_SIZE(xhci_extcap_dbc),
+				   "reg-ext-dbc");
+
+	xhci_debugfs_create_ring_dir(xhci, &xhci->cmd_ring,
+				     "command-ring",
+				     xhci->debugfs_root);
+
+	xhci_debugfs_create_ring_dir(xhci, &xhci->event_ring,
+				     "event-ring",
+				     xhci->debugfs_root);
+
+	xhci->debugfs_slots = debugfs_create_dir("devices", xhci->debugfs_root);
+
+	xhci_debugfs_create_ports(xhci, xhci->debugfs_root);
+}
+
+void xhci_debugfs_exit(struct xhci_hcd *xhci)
+{
+	struct xhci_regset	*rgs, *tmp;
+
+	debugfs_remove_recursive(xhci->debugfs_root);
+	xhci->debugfs_root = NULL;
+	xhci->debugfs_slots = NULL;
+
+	list_for_each_entry_safe(rgs, tmp, &xhci->regset_list, list)
+		xhci_debugfs_free_regset(rgs);
+}
+
+void __init xhci_debugfs_create_root(void)
+{
+	xhci_debugfs_root = debugfs_create_dir("xhci", usb_debug_root);
+}
+
+void __exit xhci_debugfs_remove_root(void)
+{
+	debugfs_remove_recursive(xhci_debugfs_root);
+	xhci_debugfs_root = NULL;
+}

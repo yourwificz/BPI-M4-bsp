@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * drivers/usb/core/sysfs.c
  *
@@ -7,13 +8,16 @@
  *
  * All of the sysfs file attributes for usb devices and interfaces.
  *
+ * Released under the GPLv2 only.
  */
 
 
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/usb.h>
+#include <linux/usb/hcd.h>
 #include <linux/usb/quirks.h>
+#include <linux/of.h>
 #include "usb.h"
 
 /* Active configuration fields */
@@ -104,6 +108,17 @@ static ssize_t bConfigurationValue_store(struct device *dev,
 static DEVICE_ATTR_IGNORE_LOCKDEP(bConfigurationValue, S_IRUGO | S_IWUSR,
 		bConfigurationValue_show, bConfigurationValue_store);
 
+#ifdef CONFIG_OF
+static ssize_t devspec_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	struct device_node *of_node = dev->of_node;
+
+	return sprintf(buf, "%pOF\n", of_node);
+}
+static DEVICE_ATTR_RO(devspec);
+#endif
+
 /* String fields */
 #define usb_string_attr(name)						\
 static ssize_t  name##_show(struct device *dev,				\
@@ -160,6 +175,26 @@ static ssize_t speed_show(struct device *dev, struct device_attribute *attr,
 	return sprintf(buf, "%s\n", speed);
 }
 static DEVICE_ATTR_RO(speed);
+
+static ssize_t rx_lanes_show(struct device *dev, struct device_attribute *attr,
+			  char *buf)
+{
+	struct usb_device *udev;
+
+	udev = to_usb_device(dev);
+	return sprintf(buf, "%d\n", udev->rx_lanes);
+}
+static DEVICE_ATTR_RO(rx_lanes);
+
+static ssize_t tx_lanes_show(struct device *dev, struct device_attribute *attr,
+			  char *buf)
+{
+	struct usb_device *udev;
+
+	udev = to_usb_device(dev);
+	return sprintf(buf, "%d\n", udev->tx_lanes);
+}
+static DEVICE_ATTR_RO(tx_lanes);
 
 static ssize_t busnum_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
@@ -494,7 +529,10 @@ static ssize_t usb2_hardware_lpm_store(struct device *dev,
 
 	if (!ret) {
 		udev->usb2_hw_lpm_allowed = value;
-		ret = usb_set_usb2_hardware_lpm(udev, value);
+		if (value)
+			ret = usb_enable_usb2_hardware_lpm(udev);
+		else
+			ret = usb_disable_usb2_hardware_lpm(udev);
 	}
 
 	usb_unlock_device(udev);
@@ -640,7 +678,8 @@ static int add_power_attributes(struct device *dev)
 		if (udev->usb2_hw_lpm_capable == 1)
 			rc = sysfs_merge_group(&dev->kobj,
 					&usb2_hardware_lpm_attr_group);
-		if (udev->speed == USB_SPEED_SUPER &&
+		if ((udev->speed == USB_SPEED_SUPER ||
+		     udev->speed == USB_SPEED_SUPER_PLUS) &&
 				udev->lpm_capable == 1)
 			rc = sysfs_merge_group(&dev->kobj,
 					&usb3_hardware_lpm_attr_group);
@@ -756,192 +795,6 @@ static ssize_t remove_store(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_IGNORE_LOCKDEP(remove, S_IWUSR, NULL, remove_store);
 
-#ifdef CONFIG_USB_RTK_HCD_TEST_MODE
-#include <linux/slab.h>
-#include <linux/usb/ch11.h>
-#include <linux/usb/hcd.h>
-
-extern int get_hub_descriptor_port(struct usb_device *hdev, void *data, int size, int port1);
-
-// copy from hub.c and rename
-/*
- * USB 2.0 spec Section 11.24.2.2
- */
-static int hub_clear_port_feature(struct usb_device *hdev, int port1, int feature)
-{
-	return usb_control_msg(hdev, usb_sndctrlpipe(hdev, 0),
-			ClearPortFeature, USB_RT_PORT, feature, port1,
-			NULL, 0, 1000);
-}
-
-/*
- * USB 2.0 spec Section 11.24.2.13
- */
-static int hub_set_port_feature(struct usb_device *hdev, int port1, int feature)
-{
-	return usb_control_msg(hdev, usb_sndctrlpipe(hdev, 0),
-			SetPortFeature, USB_RT_PORT, feature, port1,
-			NULL, 0, 1000);
-}
-
-/* use a short timeout for hub/port status fetches */
-#define	USB_STS_TIMEOUT		1000
-#define	USB_STS_RETRIES		5
-
-static int get_port_status(struct usb_device *hdev, int port1,
-		struct usb_port_status *data)
-{
-	int i, status = -ETIMEDOUT;
-
-	for (i = 0; i < USB_STS_RETRIES &&
-			(status == -ETIMEDOUT || status == -EPIPE); i++) {
-		printk("get_port_status at port %d ...\n", port1);
-		status = usb_control_msg(hdev, usb_rcvctrlpipe(hdev, 0),
-			USB_REQ_GET_STATUS, USB_DIR_IN | USB_RT_PORT, 0, port1,
-			data, sizeof(*data), USB_STS_TIMEOUT);
-	}
-	return status;
-}
-
-enum {
-	TEST_RESET = 0,
-	TEST_TEST_J,
-	TEST_TEST_K,
-	TEST_TEST_SE0_NAK,
-	TEST_TEST_PACKET,
-	TEST_TEST_FORCE_ENABLE,
-	TEST_SUSPEND_RESUME,
-	TEST_SINGLE_STEP_GET_DEVICE_DESCRIPTOR,
-	TEST_PORT_RESET,
-	MAX_CTS_TEST_CASE,
-};
-
-static ssize_t  show_runTestMode (struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct usb_device *udev = udev = to_usb_device (dev);
-	struct usb_host_config *actconfig;
-
-	if(udev->descriptor.bDeviceClass != USB_CLASS_HUB)
-		return sprintf (buf, "This node is not a HUB\n");
-
-	return sprintf (buf, "%s to runTestMode\n"
-		    "echo \"1 %d\" to run port1 HC_RESET command\n"
-		    "echo \"1 %d\" to run port1 TEST_J command\n"
-		    "echo \"1 %d\" ro run port1 TEST_K command\n"
-		    "echo \"1 %d\" to run port1 TEST_SE0_NAK command\n"
-		    "echo \"1 %d\" to run port1 TEST_PACKET command\n"
-		    "echo \"1 %d\" to run port1 TEST_FORCE_ENABLE command\n"
-		    "echo \"1 %d\" to run port1 SUSPEND/RESUME command\n"
-		    "echo \"1 %d\" to run port1 "
-		    "SINGLE_STEP_GET_DEVICE_DESCRIPTOR command\n"
-		    "echo \"1 %d\" to run port1 PORT_RESET command\n",
-		    dev_name(dev),
-		    TEST_RESET, TEST_TEST_J, TEST_TEST_K, TEST_TEST_SE0_NAK,
-		    TEST_TEST_PACKET,
-		    TEST_TEST_FORCE_ENABLE, TEST_SUSPEND_RESUME,
-		    TEST_SINGLE_STEP_GET_DEVICE_DESCRIPTOR,
-		    TEST_PORT_RESET);
-
-	return 0;
-}
-
-static ssize_t
-set_runTestMode (struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct usb_device	*udev = udev = to_usb_device (dev);
-	int value, test_case;
-	unsigned int		port1 = 1;
-
-	if ((value = sscanf (buf, "%u", &port1)) != 1)
-		return -EINVAL;
-
-	buf += 2;
-
-	if ((value = sscanf (buf, "%u", &test_case)) != 1)
-		return -EINVAL;
-
-	if(udev->descriptor.bDeviceClass != USB_CLASS_HUB)
-		return value;
-
-	switch (test_case) {
-	case TEST_RESET:
-		printk("run HC_RESET (%d) to port %d ...\n", test_case, port1);
-		if (udev->bus != NULL) {
-			struct usb_hcd *hcd = bus_to_hcd(udev->bus);
-			int ret;
-			if (hcd != NULL && hcd->driver != NULL && hcd->driver->reset)
-				ret = hcd->driver->reset(hcd);
-			if (ret)
-				printk("run HC_RESET fail ...\n");
-		}
-
-	break;
-	case TEST_TEST_J:
-	case TEST_TEST_K:
-	case TEST_TEST_SE0_NAK:
-	case TEST_TEST_PACKET:
-	case TEST_TEST_FORCE_ENABLE:
-		usb_autoresume_device(udev);
-		printk("run USB_PORT_FEAT_TEST mode %d to port %d ...\n", test_case, port1);
-		hub_set_port_feature(udev,(test_case << 8) | port1, USB_PORT_FEAT_TEST);
-
-	break;
-	case TEST_SUSPEND_RESUME:
-		printk("run TEST_SUSPEND_RESUME to the port %d of the hub ...\n", port1);
-		msleep(15000);
-		printk("set USB_PORT_FEAT_SUSPEND to the port %d of the hub ...\n", port1);
-		hub_set_port_feature(udev, port1, USB_PORT_FEAT_SUSPEND);
-		printk("set OK !!!\n");
-		msleep(15000);
-		printk("clear USB_PORT_FEAT_SUSPEND to the port %d of the hub ...\n", port1);
-		hub_clear_port_feature(udev, port1, USB_PORT_FEAT_SUSPEND);
-		printk("clear OK !!!\n");
-		{
-			printk("get_port_status port %d of the hub ...\n", port1);
-			struct usb_port_status data;
-			msleep(USB_RESUME_TIMEOUT);
-			get_port_status(udev, port1, &data);
-		}
-	break;
-	case TEST_SINGLE_STEP_GET_DEVICE_DESCRIPTOR:
-		printk("run SINGLE_STEP_GET_DEVICE_DESCRIPTOR to the port %d of the hub ...\n", port1);
-		int i, size = 0x12;
-		unsigned char		*data;
-		data = (unsigned char*)kmalloc(size, GFP_KERNEL);
-		if (!data)
-			return -ENOMEM;
-		memset (data, 0, size);
-		get_hub_descriptor_port(udev, data, size, port1);
-
-		printk(" get device descriptor\n");
-		for( i = 0; i < size; i++)
-		{
-			printk(" %.2x", data[i]);
-			if((i % 15) == 0 && (i != 0))
-				printk("\n<1>");
-		}
-		printk("\n");
-
-		kfree(data);
-
-	break;
-	case TEST_PORT_RESET:
-		printk("run PORT_RESET (%d) to port %d ...\n", test_case, port1);
-		hub_clear_port_feature(udev, port1, USB_PORT_FEAT_POWER);
-		msleep(1000);
-		hub_set_port_feature(udev, port1, USB_PORT_FEAT_POWER);
-
-	break;
-	default:
-		printk("error test_case %d !!!\n", test_case);
-	break;
-	}
-
-	return (value < 0) ? value : count;
-}
-static DEVICE_ATTR(runTestMode, S_IRUGO | S_IWUSR,
-		show_runTestMode, set_runTestMode);
-#endif /* CONFIG_USB_RTK_HCD_TEST_MODE */
 
 static struct attribute *dev_attrs[] = {
 	/* current configuration's attributes */
@@ -961,6 +814,8 @@ static struct attribute *dev_attrs[] = {
 	&dev_attr_bNumConfigurations.attr,
 	&dev_attr_bMaxPacketSize0.attr,
 	&dev_attr_speed.attr,
+	&dev_attr_rx_lanes.attr,
+	&dev_attr_tx_lanes.attr,
 	&dev_attr_busnum.attr,
 	&dev_attr_devnum.attr,
 	&dev_attr_devpath.attr,
@@ -972,9 +827,9 @@ static struct attribute *dev_attrs[] = {
 	&dev_attr_remove.attr,
 	&dev_attr_removable.attr,
 	&dev_attr_ltm_capable.attr,
-#ifdef CONFIG_USB_RTK_HCD_TEST_MODE
-	&dev_attr_runTestMode.attr,
-#endif // CONFIG_USB_RTK_HCD_TEST_MODE
+#ifdef CONFIG_OF
+	&dev_attr_devspec.attr,
+#endif
 	NULL,
 };
 static struct attribute_group dev_attr_grp = {
@@ -994,7 +849,7 @@ static struct attribute *dev_string_attrs[] = {
 static umode_t dev_string_attrs_are_visible(struct kobject *kobj,
 		struct attribute *a, int n)
 {
-	struct device *dev = container_of(kobj, struct device, kobj);
+	struct device *dev = kobj_to_dev(kobj);
 	struct usb_device *udev = to_usb_device(dev);
 
 	if (a == &dev_attr_manufacturer.attr) {
@@ -1028,13 +883,17 @@ read_descriptors(struct file *filp, struct kobject *kobj,
 		struct bin_attribute *attr,
 		char *buf, loff_t off, size_t count)
 {
-	struct device *dev = container_of(kobj, struct device, kobj);
+	struct device *dev = kobj_to_dev(kobj);
 	struct usb_device *udev = to_usb_device(dev);
 	size_t nleft = count;
 	size_t srclen, n;
 	int cfgno;
 	void *src;
+	int retval;
 
+	retval = usb_lock_device_interruptible(udev);
+	if (retval < 0)
+		return -EINTR;
 	/* The binary attribute begins with the device descriptor.
 	 * Following that are the raw descriptor entries for all the
 	 * configurations (config plus subsidiary descriptors).
@@ -1059,6 +918,7 @@ read_descriptors(struct file *filp, struct kobject *kobj,
 			off -= srclen;
 		}
 	}
+	usb_unlock_device(udev);
 	return count - nleft;
 }
 
@@ -1067,6 +927,116 @@ static struct bin_attribute dev_bin_attr_descriptors = {
 	.read = read_descriptors,
 	.size = 18 + 65535,	/* dev descr + max-size raw descriptor */
 };
+
+/*
+ * Show & store the current value of authorized_default
+ */
+static ssize_t authorized_default_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	struct usb_device *rh_usb_dev = to_usb_device(dev);
+	struct usb_bus *usb_bus = rh_usb_dev->bus;
+	struct usb_hcd *hcd;
+
+	hcd = bus_to_hcd(usb_bus);
+	return snprintf(buf, PAGE_SIZE, "%u\n", hcd->dev_policy);
+}
+
+static ssize_t authorized_default_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t size)
+{
+	ssize_t result;
+	unsigned int val;
+	struct usb_device *rh_usb_dev = to_usb_device(dev);
+	struct usb_bus *usb_bus = rh_usb_dev->bus;
+	struct usb_hcd *hcd;
+
+	hcd = bus_to_hcd(usb_bus);
+	result = sscanf(buf, "%u\n", &val);
+	if (result == 1) {
+		hcd->dev_policy = val <= USB_DEVICE_AUTHORIZE_INTERNAL ?
+			val : USB_DEVICE_AUTHORIZE_ALL;
+		result = size;
+	} else {
+		result = -EINVAL;
+	}
+	return result;
+}
+static DEVICE_ATTR_RW(authorized_default);
+
+/*
+ * interface_authorized_default_show - show default authorization status
+ * for USB interfaces
+ *
+ * note: interface_authorized_default is the default value
+ *       for initializing the authorized attribute of interfaces
+ */
+static ssize_t interface_authorized_default_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct usb_device *usb_dev = to_usb_device(dev);
+	struct usb_hcd *hcd = bus_to_hcd(usb_dev->bus);
+
+	return sprintf(buf, "%u\n", !!HCD_INTF_AUTHORIZED(hcd));
+}
+
+/*
+ * interface_authorized_default_store - store default authorization status
+ * for USB interfaces
+ *
+ * note: interface_authorized_default is the default value
+ *       for initializing the authorized attribute of interfaces
+ */
+static ssize_t interface_authorized_default_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct usb_device *usb_dev = to_usb_device(dev);
+	struct usb_hcd *hcd = bus_to_hcd(usb_dev->bus);
+	int rc = count;
+	bool val;
+
+	if (strtobool(buf, &val) != 0)
+		return -EINVAL;
+
+	if (val)
+		set_bit(HCD_FLAG_INTF_AUTHORIZED, &hcd->flags);
+	else
+		clear_bit(HCD_FLAG_INTF_AUTHORIZED, &hcd->flags);
+
+	return rc;
+}
+static DEVICE_ATTR_RW(interface_authorized_default);
+
+/* Group all the USB bus attributes */
+static struct attribute *usb_bus_attrs[] = {
+		&dev_attr_authorized_default.attr,
+		&dev_attr_interface_authorized_default.attr,
+		NULL,
+};
+
+static const struct attribute_group usb_bus_attr_group = {
+	.name = NULL,	/* we want them in the same directory */
+	.attrs = usb_bus_attrs,
+};
+
+
+static int add_default_authorized_attributes(struct device *dev)
+{
+	int rc = 0;
+
+	if (is_usb_device(dev))
+		rc = sysfs_create_group(&dev->kobj, &usb_bus_attr_group);
+
+	return rc;
+}
+
+static void remove_default_authorized_attributes(struct device *dev)
+{
+	if (is_usb_device(dev)) {
+		sysfs_remove_group(&dev->kobj, &usb_bus_attr_group);
+	}
+}
 
 int usb_create_sysfs_dev_files(struct usb_device *udev)
 {
@@ -1084,7 +1054,14 @@ int usb_create_sysfs_dev_files(struct usb_device *udev)
 	retval = add_power_attributes(dev);
 	if (retval)
 		goto error;
+
+	if (is_root_hub(udev)) {
+		retval = add_default_authorized_attributes(dev);
+		if (retval)
+			goto error;
+	}
 	return retval;
+
 error:
 	usb_remove_sysfs_dev_files(udev);
 	return retval;
@@ -1093,6 +1070,9 @@ error:
 void usb_remove_sysfs_dev_files(struct usb_device *udev)
 {
 	struct device *dev = &udev->dev;
+
+	if (is_root_hub(udev))
+		remove_default_authorized_attributes(dev);
 
 	remove_power_attributes(dev);
 	remove_persist_attributes(dev);
@@ -1145,7 +1125,7 @@ static ssize_t interface_show(struct device *dev, struct device_attribute *attr,
 	char *string;
 
 	intf = to_usb_interface(dev);
-	string = ACCESS_ONCE(intf->cur_altsetting->string);
+	string = READ_ONCE(intf->cur_altsetting->string);
 	if (!string)
 		return 0;
 	return sprintf(buf, "%s\n", string);
@@ -1161,7 +1141,7 @@ static ssize_t modalias_show(struct device *dev, struct device_attribute *attr,
 
 	intf = to_usb_interface(dev);
 	udev = interface_to_usbdev(intf);
-	alt = ACCESS_ONCE(intf->cur_altsetting);
+	alt = READ_ONCE(intf->cur_altsetting);
 
 	return sprintf(buf, "usb:v%04Xp%04Xd%04Xdc%02Xdsc%02Xdp%02X"
 			"ic%02Xisc%02Xip%02Xin%02X\n",
@@ -1258,7 +1238,7 @@ static struct attribute *intf_assoc_attrs[] = {
 static umode_t intf_assoc_attrs_are_visible(struct kobject *kobj,
 		struct attribute *a, int n)
 {
-	struct device *dev = container_of(kobj, struct device, kobj);
+	struct device *dev = kobj_to_dev(kobj);
 	struct usb_interface *intf = to_usb_interface(dev);
 
 	if (intf->intf_assoc == NULL)
@@ -1287,8 +1267,10 @@ void usb_create_sysfs_intf_files(struct usb_interface *intf)
 
 	if (!alt->string && !(udev->quirks & USB_QUIRK_CONFIG_INTF_STRINGS))
 		alt->string = usb_cache_string(udev, alt->desc.iInterface);
-	if (alt->string && device_create_file(&intf->dev, &dev_attr_interface))
-		;	/* We don't actually care if the function fails. */
+	if (alt->string && device_create_file(&intf->dev, &dev_attr_interface)) {
+		/* This is not a serious error */
+		dev_dbg(&intf->dev, "interface string descriptor file not created\n");
+	}
 	intf->sysfs_files_created = 1;
 }
 

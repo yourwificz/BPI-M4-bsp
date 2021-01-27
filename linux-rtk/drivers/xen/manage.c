@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Handle extern requests for shutdown, reboot and sysrq
  */
@@ -24,14 +25,6 @@
 
 #include <asm/xen/hypercall.h>
 #include <asm/xen/hypervisor.h>
-
-#ifdef CONFIG_RTK_XEN_SUPPORT
-#include <../../kernel/power/power.h>
-#include <xen/xen-ops.h>
-#include <soc/realtek/rtk_ipc_shm.h>
-
-void rtk_domu_suspend_context_increase(void);
-#endif
 
 enum shutdown_state {
 	SHUTDOWN_INVALID = -1,
@@ -65,7 +58,7 @@ void xen_resume_notifier_unregister(struct notifier_block *nb)
 }
 EXPORT_SYMBOL_GPL(xen_resume_notifier_unregister);
 
-#if defined(CONFIG_HIBERNATE_CALLBACKS) || defined(CONFIG_RTK_XEN_SUPPORT)
+#ifdef CONFIG_HIBERNATE_CALLBACKS
 static int xen_suspend(void *data)
 {
 	struct suspend_info *si = data;
@@ -80,23 +73,15 @@ static int xen_suspend(void *data)
 	}
 
 	gnttab_suspend();
+	xen_manage_runstate_time(-1);
 	xen_arch_pre_suspend();
 
-	/*
-	 * This hypercall returns 1 if suspend was cancelled
-	 * or the domain was merely checkpointed, and 0 if it
-	 * is resuming in a new domain.
-	 */
 	si->cancelled = HYPERVISOR_suspend(xen_pv_domain()
                                            ? virt_to_gfn(xen_start_info)
                                            : 0);
-#ifdef CONFIG_RTK_XEN_SUPPORT
-	/* Always resume from same domain context */
-	si->cancelled = 1;
-	rtk_domu_suspend_context_increase();
-#endif
 
 	xen_arch_post_suspend(si->cancelled);
+	xen_manage_runstate_time(si->cancelled ? 1 : 0);
 	gnttab_resume();
 
 	if (!si->cancelled) {
@@ -115,14 +100,6 @@ static void do_suspend(void)
 	struct suspend_info si;
 
 	shutting_down = SHUTDOWN_SUSPEND;
-
-#ifdef CONFIG_RTK_XEN_SUPPORT
-	err = pm_notifier_call_chain(PM_SUSPEND_PREPARE);
-	if (err) {
-		pr_err("%s: notify PM_SUSPEND_PREPARE failed %d\n", __func__, err);
-		goto out;
-	}
-#endif
 
 	err = freeze_processes();
 	if (err) {
@@ -152,10 +129,6 @@ static void do_suspend(void)
 		goto out_resume;
 	}
 
-#ifdef CONFIG_RTK_XEN_SUPPORT
-	rtk_xen_acpu_notify(XEN_DOMU_BOOT_ST_STATE_SCPU_SUSPEND);
-#endif
-
 	xen_arch_suspend();
 
 	si.cancelled = 1;
@@ -167,10 +140,6 @@ static void do_suspend(void)
 		xen_console_resume();
 
 	raw_notifier_call_chain(&xen_resume_notifier, 0, NULL);
-
-#ifdef CONFIG_RTK_XEN_SUPPORT
-	rtk_xen_acpu_notify(XEN_DOMU_BOOT_ST_STATE_SCPU_RESUME);
-#endif
 
 	dpm_resume_start(si.cancelled ? PMSG_THAW : PMSG_RESTORE);
 
@@ -192,19 +161,9 @@ out_resume:
 out_thaw:
 	thaw_processes();
 out:
-#ifdef CONFIG_RTK_XEN_SUPPORT
-	pm_notifier_call_chain(PM_POST_SUSPEND);
-#endif
 	shutting_down = SHUTDOWN_INVALID;
 }
-
-int xen_suspend_to_ram(void)
-{
-	do_suspend();
-	return 0;
-}
-
-#endif	/* CONFIG_HIBERNATE_CALLBACKS || CONFIG_RTK_XEN_SUPPORT */
+#endif	/* CONFIG_HIBERNATE_CALLBACKS */
 
 struct shutdown_handler {
 #define SHUTDOWN_CMD_SIZE 11
@@ -229,6 +188,7 @@ static void do_poweroff(void)
 {
 	switch (system_state) {
 	case SYSTEM_BOOTING:
+	case SYSTEM_SCHEDULING:
 		orderly_poweroff(true);
 		break;
 	case SYSTEM_RUNNING:
@@ -251,13 +211,13 @@ static struct shutdown_handler shutdown_handlers[] = {
 	{ "poweroff",	true,	do_poweroff },
 	{ "halt",	false,	do_poweroff },
 	{ "reboot",	true,	do_reboot   },
-#if defined(CONFIG_HIBERNATE_CALLBACKS) || defined(CONFIG_RTK_XEN_SUPPORT)
+#ifdef CONFIG_HIBERNATE_CALLBACKS
 	{ "suspend",	true,	do_suspend  },
 #endif
 };
 
 static void shutdown_handler(struct xenbus_watch *watch,
-			     const char **vec, unsigned int len)
+			     const char *path, const char *token)
 {
 	char *str;
 	struct xenbus_transaction xbt;
@@ -305,8 +265,8 @@ static void shutdown_handler(struct xenbus_watch *watch,
 }
 
 #ifdef CONFIG_MAGIC_SYSRQ
-static void sysrq_handler(struct xenbus_watch *watch, const char **vec,
-			  unsigned int len)
+static void sysrq_handler(struct xenbus_watch *watch, const char *path,
+			  const char *token)
 {
 	char sysrq_key = '\0';
 	struct xenbus_transaction xbt;
@@ -321,17 +281,26 @@ static void sysrq_handler(struct xenbus_watch *watch, const char **vec,
 		/*
 		 * The Xenstore watch fires directly after registering it and
 		 * after a suspend/resume cycle. So ENOENT is no error but
-		 * might happen in those cases.
+		 * might happen in those cases. ERANGE is observed when we get
+		 * an empty value (''), this happens when we acknowledge the
+		 * request by writing '\0' below.
 		 */
-		if (err != -ENOENT)
+		if (err != -ENOENT && err != -ERANGE)
 			pr_err("Error %d reading sysrq code in control/sysrq\n",
 			       err);
 		xenbus_transaction_end(xbt, 1);
 		return;
 	}
 
-	if (sysrq_key != '\0')
-		xenbus_printf(xbt, "control", "sysrq", "%c", '\0');
+	if (sysrq_key != '\0') {
+		err = xenbus_printf(xbt, "control", "sysrq", "%c", '\0');
+		if (err) {
+			pr_err("%s: Error %d writing sysrq in control/sysrq\n",
+			       __func__, err);
+			xenbus_transaction_end(xbt, 1);
+			return;
+		}
+	}
 
 	err = xenbus_transaction_end(xbt, 0);
 	if (err == -EAGAIN)
@@ -383,7 +352,12 @@ static int setup_shutdown_watcher(void)
 			continue;
 		snprintf(node, FEATURE_PATH_SIZE, "feature-%s",
 			 shutdown_handlers[idx].command);
-		xenbus_printf(XBT_NIL, "control", node, "%u", 1);
+		err = xenbus_printf(XBT_NIL, "control", node, "%u", 1);
+		if (err) {
+			pr_err("%s: Error %d writing %s\n", __func__,
+				err, node);
+			return err;
+		}
 	}
 
 	return 0;

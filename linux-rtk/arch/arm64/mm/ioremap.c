@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Based on arch/arm/mm/ioremap.c
  *
@@ -6,18 +7,6 @@
  * Hacked to allow all architectures to build, and various cleanups
  * by Russell King
  * Copyright (C) 2012 ARM Ltd.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <linux/export.h>
@@ -27,8 +16,6 @@
 
 #include <asm/fixmap.h>
 #include <asm/tlbflush.h>
-#include <asm/pgalloc.h>
-#include <linux/rtk_trace.h>
 
 static void __iomem *__ioremap_caller(phys_addr_t phys_addr, size_t size,
 				      pgprot_t prot, void *caller)
@@ -56,11 +43,8 @@ static void __iomem *__ioremap_caller(phys_addr_t phys_addr, size_t size,
 	/*
 	 * Don't allow RAM to be mapped.
 	 */
-#ifdef CONFIG_RTK_MEM_REMAP	//Allow Realtek RTD129x to mapping RAM area
-#else
-if (WARN_ON(pfn_valid(__phys_to_pfn(phys_addr))))
-	return NULL;
-#endif
+	if (WARN_ON(pfn_valid(__phys_to_pfn(phys_addr))))
+		return NULL;
 
 	area = get_vm_area_caller(size, VM_IOREMAP, caller);
 	if (!area)
@@ -74,10 +58,6 @@ if (WARN_ON(pfn_valid(__phys_to_pfn(phys_addr))))
 		return NULL;
 	}
 
-#ifdef CONFIG_RTK_TRACER
-	inject_vmap_info((void*)addr, size, phys_addr, 1);
-#endif
-
 	return (void __iomem *)(offset + addr);
 }
 
@@ -88,7 +68,7 @@ void __iomem *__ioremap(phys_addr_t phys_addr, size_t size, pgprot_t prot)
 }
 EXPORT_SYMBOL(__ioremap);
 
-void __iounmap(volatile void __iomem *io_addr)
+void iounmap(volatile void __iomem *io_addr)
 {
 	unsigned long addr = (unsigned long)io_addr & PAGE_MASK;
 
@@ -96,13 +76,10 @@ void __iounmap(volatile void __iomem *io_addr)
 	 * We could get an address outside vmalloc range in case
 	 * of ioremap_cache() reusing a RAM mapping.
 	 */
-	if (VMALLOC_START <= addr && addr < VMALLOC_END)
+	if (is_vmalloc_addr((void *)addr))
 		vunmap((void *)addr);
-#ifdef CONFIG_RTK_TRACER
-	remove_vmap_info((void*)addr, 1);
-#endif
 }
-EXPORT_SYMBOL(__iounmap);
+EXPORT_SYMBOL(iounmap);
 
 void __iomem *ioremap_cache(phys_addr_t phys_addr, size_t size)
 {

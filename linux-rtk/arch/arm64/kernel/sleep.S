@@ -1,12 +1,9 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #include <linux/errno.h>
 #include <linux/linkage.h>
 #include <asm/asm-offsets.h>
 #include <asm/assembler.h>
-
-#ifdef CONFIG_RTK_PLATFORM
-#define GICD_BASE 0xFF011000
-#define GICC_BASE 0xFF012000
-#endif /* CONFIG_RTK_PLATFORM */
+#include <asm/smp.h>
 
 	.text
 /*
@@ -31,7 +28,7 @@
  *	aff0 = mpidr_masked & 0xff;
  *	aff1 = mpidr_masked & 0xff00;
  *	aff2 = mpidr_masked & 0xff0000;
- *	aff2 = mpidr_masked & 0xff00000000;
+ *	aff3 = mpidr_masked & 0xff00000000;
  *	dst = (aff0 >> rs0 | aff1 >> rs1 | aff2 >> rs2 | aff3 >> rs3);
  *}
  * Input registers: rs0, rs1, rs2, rs3, mpidr, mask
@@ -65,7 +62,7 @@
  *
  *  x0 = struct sleep_stack_data area
  */
-ENTRY(__cpu_suspend_enter)
+SYM_FUNC_START(__cpu_suspend_enter)
 	stp	x29, lr, [x0, #SLEEP_STACK_DATA_CALLEE_REGS]
 	stp	x19, x20, [x0,#SLEEP_STACK_DATA_CALLEE_REGS+16]
 	stp	x21, x22, [x0,#SLEEP_STACK_DATA_CALLEE_REGS+32]
@@ -98,64 +95,22 @@ ENTRY(__cpu_suspend_enter)
 	ldp	x29, lr, [sp], #16
 	mov	x0, #1
 	ret
-ENDPROC(__cpu_suspend_enter)
-
-#ifdef CONFIG_RTK_PLATFORM
-ENTRY(gic_init_secure)
-	mov	w9, #0x3 /* EnableGrp0 | EnableGrp1 */
-	str	w9, [x0, 0x000] /* Secure GICD_CTLR */
-	ldr	w9, [x0, 0x004]
-	and	w10, w9, #0x1f /* ITLinesNumber */
-	cbz	w10, 1f /* No SPIs */
-	add	w10, w10, #0x1 /* Also add SGI/PPI to the counter */
-	add	x11, x0, (0x080)
-	mov	w9, #~0 /* Config SGI/PPI/SPIs as Grp1 */
-0:
-	str	w9, [x11], #0x4
-	sub	w10, w10, #0x1
-	cbnz	w10, 0b
-1:
-	ret
-ENDPROC(gic_init_secure)
-
-ENTRY(gic_init_secure_percpu)
-	mov	w9, #~0			/* Config SGIs and PPIs as Grp1 */
-	str	w9, [x0, 0x080]		/* GICD_IGROUPR0 */
-	mov	w9, #0x1		/* Enable SGI 0 */
-	str	w9, [x0, 0x100]
-					/* Initialize Cpu Interface */
-	mov	w9, #0x1e7		/* Disable IRQ/FIQ Bypass & */
-					/* Enable Ack Group1 Interrupt & */
-					/* EnableGrp0 & EnableGrp1 */
-	str	w9, [x1, 0x000]		/* Secure GICC_CTLR */
-	mov	w9, #0xf8		/* Non-Secure access to GICC_PMR */
-	str	w9, [x1, 0x004]
-	ret
-ENDPROC(gic_init_secure_percpu)
-#endif /* CONFIG_RTK_PLATFORM */
+SYM_FUNC_END(__cpu_suspend_enter)
 
 	.pushsection ".idmap.text", "awx"
-ENTRY(cpu_resume)
-#ifdef CONFIG_ARCH_RTD129x
-	ldr	x0, =GICD_BASE
-	bl	gic_init_secure
-	ldr	x0, =GICD_BASE
-	ldr	x1, =GICC_BASE
-	bl	gic_init_secure_percpu
-	bl	armv8_switch_to_el2
-#endif /* CONFIG_ARCH_RTD129x */
-
+SYM_CODE_START(cpu_resume)
 	bl	el2_setup		// if in EL2 drop to EL1 cleanly
 	bl	__cpu_setup
 	/* enable the MMU early - so we can access sleep_save_stash by va */
+	adrp	x1, swapper_pg_dir
 	bl	__enable_mmu
 	ldr	x8, =_cpu_resume
 	br	x8
-ENDPROC(cpu_resume)
+SYM_CODE_END(cpu_resume)
 	.ltorg
 	.popsection
 
-ENTRY(_cpu_resume)
+SYM_FUNC_START(_cpu_resume)
 	mrs	x1, mpidr_el1
 	adr_l	x8, mpidr_hash		// x8 = struct mpidr_hash virt address
 
@@ -191,4 +146,4 @@ ENTRY(_cpu_resume)
 	ldp	x29, lr, [x29]
 	mov	x0, #0
 	ret
-ENDPROC(_cpu_resume)
+SYM_FUNC_END(_cpu_resume)

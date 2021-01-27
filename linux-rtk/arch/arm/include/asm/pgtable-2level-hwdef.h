@@ -1,11 +1,8 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  *  arch/arm/include/asm/pgtable-2level-hwdef.h
  *
  *  Copyright (C) 1995-2002 Russell King
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  */
 #ifndef _ASM_PGTABLE_2LEVEL_HWDEF_H
 #define _ASM_PGTABLE_2LEVEL_HWDEF_H
@@ -39,7 +36,6 @@
 #define PMD_SECT_S		(_AT(pmdval_t, 1) << 16)	/* v6 */
 #define PMD_SECT_nG		(_AT(pmdval_t, 1) << 17)	/* v6 */
 #define PMD_SECT_SUPER		(_AT(pmdval_t, 1) << 18)	/* v6 */
-#define PMD_SECT_NS		(_AT(pmdval_t, 1) << 19)	/* v6 */
 #define PMD_SECT_AF		(_AT(pmdval_t, 0))
 
 #define PMD_SECT_UNCACHED	(_AT(pmdval_t, 0))

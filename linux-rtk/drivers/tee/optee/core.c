@@ -1,15 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2015, Linaro Limited
- *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -26,53 +17,14 @@
 #include <linux/tee_drv.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
+#include <linux/workqueue.h>
 #include "optee_private.h"
 #include "optee_smc.h"
-#include <linux/proc_fs.h>
 #include "shm_pool.h"
 
-
-#if defined(CONFIG_RTD139x) || defined(CONFIG_RTD16xx)
-#include <linux/semaphore.h>
-#endif
 #define DRIVER_NAME "optee"
 
-#define OPTEE_SHM_NUM_PRIV_PAGES	1
-
-//#define BL31_TSP_TEST
-
-#if defined(CONFIG_RTD139x) || defined(CONFIG_RTD16xx)
-static struct semaphore sem_tee;
-#endif
-
-#ifdef BL31_TSP_TEST
-ssize_t tsp_trigger(struct file *filp, const char __user *buff, unsigned long len, void *data);
-static struct proc_dir_entry *proc_file = NULL;
-static struct file_operations proc_fops = 
-{
-.owner = THIS_MODULE,
-.write = tsp_trigger
-};
-
-ssize_t tsp_trigger(struct file *filp, const char __user *buff, unsigned long len, void *data) 
-{ 	
-	printk(KERN_ERR "tsp_trigger !!! \n");
-	unsigned int arg1 = 3, arg2 = 5;
-	printk(KERN_ERR "TSP_ADD: x1 = 3, x2 = 5 \n");
-	asm volatile("mov x1, %0" : : "r"(arg1): "cc");
-	asm volatile("mov x2, %0" : : "r"(arg2): "cc");
-	asm volatile("ldr x0, =0xf2002000" : : : "cc");
-	asm volatile("isb" : : : "cc");
-	asm volatile("smc #0" : : : "cc");
-	asm volatile("isb" : : : "cc");
-	asm volatile("mov %0, x1" : "=r"(arg1): : "cc");
-	asm volatile("mov %0, x2" : "=r"(arg2): : "cc");
-	asm volatile("isb" : : : "cc");
-	printk(KERN_ERR "Result: x1 = %u, x2 = %u \n",arg1, arg2);	
-	return len; 
-}
-
-#endif
+#define OPTEE_SHM_NUM_PRIV_PAGES	CONFIG_OPTEE_SHM_NUM_PRIV_PAGES
 
 /**
  * optee_from_msg_param() - convert from OPTEE_MSG parameters to
@@ -264,7 +216,14 @@ static void optee_get_version(struct tee_device *teedev,
 
 	if (optee->sec_caps & OPTEE_SMC_SEC_CAP_DYNAMIC_SHM)
 		v.gen_caps |= TEE_GEN_CAP_REG_MEM;
+	if (optee->sec_caps & OPTEE_SMC_SEC_CAP_MEMREF_NULL)
+		v.gen_caps |= TEE_GEN_CAP_MEMREF_NULL;
 	*vers = v;
+}
+
+static void optee_bus_scan(struct work_struct *work)
+{
+	WARN_ON(optee_enumerate_devices(PTA_CMD_GET_DEVICES_SUPP));
 }
 
 static int optee_open(struct tee_context *ctx)
@@ -290,10 +249,25 @@ static int optee_open(struct tee_context *ctx)
 			kfree(ctxdata);
 			return -EBUSY;
 		}
-	}
 
+		if (!optee->scan_bus_done) {
+			INIT_WORK(&optee->scan_bus_work, optee_bus_scan);
+			optee->scan_bus_wq = create_workqueue("optee_bus_scan");
+			if (!optee->scan_bus_wq) {
+				kfree(ctxdata);
+				return -ECHILD;
+			}
+			queue_work(optee->scan_bus_wq, &optee->scan_bus_work);
+			optee->scan_bus_done = true;
+		}
+	}
 	mutex_init(&ctxdata->mutex);
 	INIT_LIST_HEAD(&ctxdata->sess_list);
+
+	if (optee->sec_caps & OPTEE_SMC_SEC_CAP_MEMREF_NULL)
+		ctx->cap_memref_null  = true;
+	else
+		ctx->cap_memref_null = false;
 
 	ctx->data = ctxdata;
 	return 0;
@@ -345,8 +319,13 @@ static void optee_release(struct tee_context *ctx)
 
 	ctx->data = NULL;
 
-	if (teedev == optee->supp_teedev)
+	if (teedev == optee->supp_teedev) {
+		if (optee->scan_bus_wq) {
+			destroy_workqueue(optee->scan_bus_wq);
+			optee->scan_bus_wq = NULL;
+		}
 		optee_supp_release(&optee->supp);
+	}
 }
 
 static const struct tee_driver_ops optee_ops = {
@@ -396,6 +375,27 @@ static bool optee_msg_api_uid_is_optee_api(optee_invoke_fn *invoke_fn)
 	return false;
 }
 
+static void optee_msg_get_os_revision(optee_invoke_fn *invoke_fn)
+{
+	union {
+		struct arm_smccc_res smccc;
+		struct optee_smc_call_get_os_revision_result result;
+	} res = {
+		.result = {
+			.build_id = 0
+		}
+	};
+
+	invoke_fn(OPTEE_SMC_CALL_GET_OS_REVISION, 0, 0, 0, 0, 0, 0, 0,
+		  &res.smccc);
+
+	if (res.result.build_id)
+		pr_info("revision %lu.%lu (%08lx)", res.result.major,
+			res.result.minor, res.result.build_id);
+	else
+		pr_info("revision %lu.%lu", res.result.major, res.result.minor);
+}
+
 static bool optee_msg_api_revision_is_compatible(optee_invoke_fn *invoke_fn)
 {
 	union {
@@ -438,9 +438,35 @@ static bool optee_msg_exchange_capabilities(optee_invoke_fn *invoke_fn,
 	return true;
 }
 
+static struct tee_shm_pool *optee_config_dyn_shm(void)
+{
+	struct tee_shm_pool_mgr *priv_mgr;
+	struct tee_shm_pool_mgr *dmabuf_mgr;
+	void *rc;
+
+	rc = optee_shm_pool_alloc_pages();
+	if (IS_ERR(rc))
+		return rc;
+	priv_mgr = rc;
+
+	rc = optee_shm_pool_alloc_pages();
+	if (IS_ERR(rc)) {
+		tee_shm_pool_mgr_destroy(priv_mgr);
+		return rc;
+	}
+	dmabuf_mgr = rc;
+
+	rc = tee_shm_pool_alloc(priv_mgr, dmabuf_mgr);
+	if (IS_ERR(rc)) {
+		tee_shm_pool_mgr_destroy(priv_mgr);
+		tee_shm_pool_mgr_destroy(dmabuf_mgr);
+	}
+
+	return rc;
+}
+
 static struct tee_shm_pool *
-optee_config_shm_memremap(optee_invoke_fn *invoke_fn, void **memremaped_shm,
-			  u32 sec_caps)
+optee_config_shm_memremap(optee_invoke_fn *invoke_fn, void **memremaped_shm)
 {
 	union {
 		struct arm_smccc_res smccc;
@@ -455,10 +481,11 @@ optee_config_shm_memremap(optee_invoke_fn *invoke_fn, void **memremaped_shm,
 	struct tee_shm_pool_mgr *priv_mgr;
 	struct tee_shm_pool_mgr *dmabuf_mgr;
 	void *rc;
+	const int sz = OPTEE_SHM_NUM_PRIV_PAGES * PAGE_SIZE;
 
 	invoke_fn(OPTEE_SMC_GET_SHM_CONFIG, 0, 0, 0, 0, 0, 0, 0, &res.smccc);
 	if (res.result.status != OPTEE_SMC_RETURN_OK) {
-		pr_info("shm service not available\n");
+		pr_err("static shm service not available\n");
 		return ERR_PTR(-ENOENT);
 	}
 
@@ -484,28 +511,15 @@ optee_config_shm_memremap(optee_invoke_fn *invoke_fn, void **memremaped_shm,
 	}
 	vaddr = (unsigned long)va;
 
-	/*
-	 * If OP-TEE can work with unregistered SHM, we will use own pool
-	 * for private shm
-	 */
-	if (sec_caps & OPTEE_SMC_SEC_CAP_DYNAMIC_SHM) {
-		rc = optee_shm_pool_alloc_pages();
-		if (IS_ERR(rc))
-			goto err_memunmap;
-		priv_mgr = rc;
-	} else {
-		const size_t sz = OPTEE_SHM_NUM_PRIV_PAGES * PAGE_SIZE;
+	rc = tee_shm_pool_mgr_alloc_res_mem(vaddr, paddr, sz,
+					    3 /* 8 bytes aligned */);
+	if (IS_ERR(rc))
+		goto err_memunmap;
+	priv_mgr = rc;
 
-		rc = tee_shm_pool_mgr_alloc_res_mem(vaddr, paddr, sz,
-						    3 /* 8 bytes aligned */);
-		if (IS_ERR(rc))
-			goto err_memunmap;
-		priv_mgr = rc;
-
-		vaddr += sz;
-		paddr += sz;
-		size -= sz;
-	}
+	vaddr += sz;
+	paddr += sz;
+	size -= sz;
 
 	rc = tee_shm_pool_mgr_alloc_res_mem(vaddr, paddr, size, PAGE_SHIFT);
 	if (IS_ERR(rc))
@@ -536,13 +550,7 @@ static void optee_smccc_smc(unsigned long a0, unsigned long a1,
 			    unsigned long a6, unsigned long a7,
 			    struct arm_smccc_res *res)
 {
-#if defined(CONFIG_RTD139x) || defined(CONFIG_RTD16xx)
-	down(&sem_tee);
-#endif
 	arm_smccc_smc(a0, a1, a2, a3, a4, a5, a6, a7, res);
-#if defined(CONFIG_RTD139x) || defined(CONFIG_RTD16xx)
-	up(&sem_tee);
-#endif
 }
 
 static void optee_smccc_hvc(unsigned long a0, unsigned long a1,
@@ -554,13 +562,13 @@ static void optee_smccc_hvc(unsigned long a0, unsigned long a1,
 	arm_smccc_hvc(a0, a1, a2, a3, a4, a5, a6, a7, res);
 }
 
-static optee_invoke_fn *get_invoke_func(struct device_node *np)
+static optee_invoke_fn *get_invoke_func(struct device *dev)
 {
 	const char *method;
 
-	pr_info("probing for conduit method from DT.\n");
+	pr_info("probing for conduit method.\n");
 
-	if (of_property_read_string(np, "method", &method)) {
+	if (device_property_read_string(dev, "method", &method)) {
 		pr_warn("missing \"method\" property\n");
 		return ERR_PTR(-ENXIO);
 	}
@@ -574,56 +582,81 @@ static optee_invoke_fn *get_invoke_func(struct device_node *np)
 	return ERR_PTR(-EINVAL);
 }
 
-static struct optee *optee_probe(struct device_node *np)
+static int optee_remove(struct platform_device *pdev)
+{
+	struct optee *optee = platform_get_drvdata(pdev);
+
+	/*
+	 * Ask OP-TEE to free all cached shared memory objects to decrease
+	 * reference counters and also avoid wild pointers in secure world
+	 * into the old shared memory range.
+	 */
+	optee_disable_shm_cache(optee);
+
+	/*
+	 * The two devices have to be unregistered before we can free the
+	 * other resources.
+	 */
+	tee_device_unregister(optee->supp_teedev);
+	tee_device_unregister(optee->teedev);
+
+	tee_shm_pool_free(optee->pool);
+	if (optee->memremaped_shm)
+		memunmap(optee->memremaped_shm);
+	optee_wait_queue_exit(&optee->wait_queue);
+	optee_supp_uninit(&optee->supp);
+	mutex_destroy(&optee->call_queue.mutex);
+
+	kfree(optee);
+
+	return 0;
+}
+
+static int optee_probe(struct platform_device *pdev)
 {
 	optee_invoke_fn *invoke_fn;
-	struct tee_shm_pool *pool;
+	struct tee_shm_pool *pool = ERR_PTR(-EINVAL);
 	struct optee *optee = NULL;
 	void *memremaped_shm = NULL;
 	struct tee_device *teedev;
 	u32 sec_caps;
 	int rc;
-	
-#ifdef BL31_TSP_TEST
-	proc_file = proc_create("tsp_trigger", 0x0644, NULL, &proc_fops);
-	
-	if(!proc_file){
-		printk(KERN_ERR "/proc/tsp_trigger can't be created! \n");
-	}
-	else{
-		printk(KERN_ERR "/proc/tsp_trigger is created. \n");
-	}	
-#endif
 
-	invoke_fn = get_invoke_func(np);
+	invoke_fn = get_invoke_func(&pdev->dev);
 	if (IS_ERR(invoke_fn))
-		return (void *)invoke_fn;
+		return PTR_ERR(invoke_fn);
 
 	if (!optee_msg_api_uid_is_optee_api(invoke_fn)) {
 		pr_warn("api uid mismatch\n");
-		return ERR_PTR(-EINVAL);
+		return -EINVAL;
 	}
+
+	optee_msg_get_os_revision(invoke_fn);
 
 	if (!optee_msg_api_revision_is_compatible(invoke_fn)) {
 		pr_warn("api revision mismatch\n");
-		return ERR_PTR(-EINVAL);
+		return -EINVAL;
 	}
 
 	if (!optee_msg_exchange_capabilities(invoke_fn, &sec_caps)) {
 		pr_warn("capabilities mismatch\n");
-		return ERR_PTR(-EINVAL);
+		return -EINVAL;
 	}
 
 	/*
-	 * We have no other option for shared memory, if secure world
-	 * doesn't have any reserved memory we can use we can't continue.
+	 * Try to use dynamic shared memory if possible
 	 */
-	if (!(sec_caps & OPTEE_SMC_SEC_CAP_HAVE_RESERVED_SHM))
-		return ERR_PTR(-EINVAL);
+	if (sec_caps & OPTEE_SMC_SEC_CAP_DYNAMIC_SHM)
+		pool = optee_config_dyn_shm();
 
-	pool = optee_config_shm_memremap(invoke_fn, &memremaped_shm, sec_caps);
+	/*
+	 * If dynamic shared memory is not available or failed - try static one
+	 */
+	if (IS_ERR(pool) && (sec_caps & OPTEE_SMC_SEC_CAP_HAVE_RESERVED_SHM))
+		pool = optee_config_shm_memremap(invoke_fn, &memremaped_shm);
+
 	if (IS_ERR(pool))
-		return (void *)pool;
+		return PTR_ERR(pool);
 
 	optee = kzalloc(sizeof(*optee), GFP_KERNEL);
 	if (!optee) {
@@ -665,8 +698,19 @@ static struct optee *optee_probe(struct device_node *np)
 
 	optee_enable_shm_cache(optee);
 
+	if (optee->sec_caps & OPTEE_SMC_SEC_CAP_DYNAMIC_SHM)
+		pr_info("dynamic shared memory is enabled\n");
+
+	platform_set_drvdata(pdev, optee);
+
+	rc = optee_enumerate_devices(PTA_CMD_GET_DEVICES);
+	if (rc) {
+		optee_remove(pdev);
+		return rc;
+	}
+
 	pr_info("initialized driver\n");
-	return optee;
+	return 0;
 err:
 	if (optee) {
 		/*
@@ -682,85 +726,28 @@ err:
 		tee_shm_pool_free(pool);
 	if (memremaped_shm)
 		memunmap(memremaped_shm);
-	return ERR_PTR(rc);
+	return rc;
 }
 
-static void optee_remove(struct optee *optee)
-{
-	/*
-	 * Ask OP-TEE to free all cached shared memory objects to decrease
-	 * reference counters and also avoid wild pointers in secure world
-	 * into the old shared memory range.
-	 */
-	optee_disable_shm_cache(optee);
-
-	/*
-	 * The two devices has to be unregistered before we can free the
-	 * other resources.
-	 */
-	tee_device_unregister(optee->supp_teedev);
-	tee_device_unregister(optee->teedev);
-
-	tee_shm_pool_free(optee->pool);
-	if (optee->memremaped_shm)
-		memunmap(optee->memremaped_shm);
-	optee_wait_queue_exit(&optee->wait_queue);
-	optee_supp_uninit(&optee->supp);
-	mutex_destroy(&optee->call_queue.mutex);
-
-	kfree(optee);
-}
-
-static const struct of_device_id optee_match[] = {
+static const struct of_device_id optee_dt_match[] = {
 	{ .compatible = "linaro,optee-tz" },
 	{},
 };
+MODULE_DEVICE_TABLE(of, optee_dt_match);
 
-static struct optee *optee_svc;
-
-static int __init optee_driver_init(void)
-{
-	struct device_node *fw_np;
-	struct device_node *np;
-	struct optee *optee;
-#if defined(CONFIG_RTD139x) || defined(CONFIG_RTD16xx)
-	printk(KERN_INFO "TEE SEM INIT\n");
-	sema_init( &sem_tee, 3);
-#endif
-
-	/* Node is supposed to be below /firmware */
-	fw_np = of_find_node_by_name(NULL, "firmware");
-	if (!fw_np)
-		return -ENODEV;
-
-	np = of_find_matching_node(fw_np, optee_match);
-	if (!np)
-		return -ENODEV;
-
-	optee = optee_probe(np);
-	of_node_put(np);
-
-	if (IS_ERR(optee))
-		return PTR_ERR(optee);
-
-	optee_svc = optee;
-
-	return 0;
-}
-fs_initcall(optee_driver_init);
-
-static void __exit optee_driver_exit(void)
-{
-	struct optee *optee = optee_svc;
-
-	optee_svc = NULL;
-	if (optee)
-		optee_remove(optee);
-}
-module_exit(optee_driver_exit);
+static struct platform_driver optee_driver = {
+	.probe  = optee_probe,
+	.remove = optee_remove,
+	.driver = {
+		.name = "optee",
+		.of_match_table = optee_dt_match,
+	},
+};
+module_platform_driver(optee_driver);
 
 MODULE_AUTHOR("Linaro");
 MODULE_DESCRIPTION("OP-TEE driver");
 MODULE_SUPPORTED_DEVICE("");
 MODULE_VERSION("1.0");
 MODULE_LICENSE("GPL v2");
+MODULE_ALIAS("platform:optee");
