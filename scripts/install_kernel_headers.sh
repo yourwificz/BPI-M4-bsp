@@ -54,9 +54,9 @@ find . -path './scripts/*'   -prune -o \
 # Clean compile host executables and replace some with target arch.
 find "$TARGET/scripts" -type f | while read i; do if file -b $i | egrep -q "^ELF.*executable"; then rm "$i"; fi; done
 (cd scripts && ${CROSS_COMPILE}gcc kallsyms.c -o "$TARGET/scripts/kallsyms")
-(cd scripts && ${CROSS_COMPILE}gcc pnmtologo.c -o "$TARGET/scripts/pnmtologo")
-(cd scripts && ${CROSS_COMPILE}gcc conmakehash.c -o "$TARGET/scripts/conmakehash")
-(cd scripts && ${CROSS_COMPILE}gcc basic/bin2c.c -o "$TARGET/scripts/basic/bin2c")
+(cd drivers/video/logo && ${CROSS_COMPILE}gcc pnmtologo.c -o "$TARGET/drivers/video/logo/pnmtologo")
+(cd drivers/tty/vt && ${CROSS_COMPILE}gcc conmakehash.c -o "$TARGET/drivers/tty/vt/conmakehash")
+(cd scripts && ${CROSS_COMPILE}gcc bin2c.c -o "$TARGET/scripts/bin2c")
 (cd scripts && ${CROSS_COMPILE}gcc recordmcount.c -o "$TARGET/scripts/recordmcount")
 (cd scripts && ${CROSS_COMPILE}gcc -I../tools/include sortextable.c -o "$TARGET/scripts/sortextable")
 (cd scripts && ${CROSS_COMPILE}gcc unifdef.c -o "$TARGET/scripts/unifdef")
