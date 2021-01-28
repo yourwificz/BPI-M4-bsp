@@ -1,5 +1,5 @@
 ## **BPI-M4-bsp**
-Banana Pi M4 board bsp (u-boot 2015.7 & Kernel 4.9.119)
+Banana Pi M4 board bsp (u-boot 2015.7 & Kernel 5.10)
 
 
 ----------
