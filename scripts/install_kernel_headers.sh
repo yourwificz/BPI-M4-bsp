@@ -58,7 +58,7 @@ find "$TARGET/scripts" -type f | while read i; do if file -b $i | egrep -q "^ELF
 (cd drivers/tty/vt && ${CROSS_COMPILE}gcc conmakehash.c -o "$TARGET/drivers/tty/vt/conmakehash")
 (cd scripts && ${CROSS_COMPILE}gcc bin2c.c -o "$TARGET/scripts/bin2c")
 (cd scripts && ${CROSS_COMPILE}gcc recordmcount.c -o "$TARGET/scripts/recordmcount")
-(cd scripts && ${CROSS_COMPILE}gcc -I../tools/include sortextable.c -o "$TARGET/scripts/sortextable")
+(cd scripts && ${CROSS_COMPILE}gcc -I../tools/include sorttable.c -o "$TARGET/scripts/sorttable")
 (cd scripts && ${CROSS_COMPILE}gcc unifdef.c -o "$TARGET/scripts/unifdef")
 (cd scripts/basic && ${CROSS_COMPILE}gcc fixdep.c -o "$TARGET/scripts/basic/fixdep")
 (cd scripts/mod && ${CROSS_COMPILE}gcc modpost.c file2alias.c sumversion.c -o "$TARGET/scripts/mod/modpost")
